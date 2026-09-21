@@ -39,9 +39,9 @@ class _WatchlistScreenState extends State<WatchlistScreen> {
   bool _refreshing = false;
   Timer? _timer;
   final _tickerCtrl = TextEditingController();
-  String _inputMirror = '';
-  String _resolvedPreview = '';
-  bool _previewLookupPending = false;
+  final ValueNotifier<String> _inputMirror = ValueNotifier<String>('');
+  final ValueNotifier<String> _resolvedPreview = ValueNotifier<String>('');
+  final ValueNotifier<bool> _previewLookupPending = ValueNotifier<bool>(false);
   int _previewSeq = 0;
   final _money = NumberFormat('#,##0.##');
 
@@ -88,11 +88,9 @@ class _WatchlistScreenState extends State<WatchlistScreen> {
 
   void _onTickerInputChanged() {
     final v = _tickerCtrl.text.trim();
-    if (v == _inputMirror) return;
-    setState(() {
-      _inputMirror = v;
-      _resolvedPreview = _computePreviewSync(v);
-    });
+    if (v == _inputMirror.value) return;
+    _inputMirror.value = v;
+    _resolvedPreview.value = _computePreviewSync(v);
     _schedulePreviewLookup(v);
   }
 
@@ -109,10 +107,8 @@ class _WatchlistScreenState extends State<WatchlistScreen> {
     final seq = ++_previewSeq;
     if (raw.isEmpty) {
       if (mounted && seq == _previewSeq) {
-        setState(() {
-          _previewLookupPending = false;
-          _resolvedPreview = '';
-        });
+        _previewLookupPending.value = false;
+        _resolvedPreview.value = '';
       }
       return;
     }
@@ -120,15 +116,13 @@ class _WatchlistScreenState extends State<WatchlistScreen> {
     final needsFetch = code != null && widget.names.lookup(code) == null;
     if (!needsFetch) {
       if (mounted && seq == _previewSeq) {
-        setState(() {
-          _previewLookupPending = false;
-          _resolvedPreview = _computePreviewSync(raw);
-        });
+        _previewLookupPending.value = false;
+        _resolvedPreview.value = _computePreviewSync(raw);
       }
       return;
     }
     if (mounted && seq == _previewSeq) {
-      setState(() => _previewLookupPending = true);
+      _previewLookupPending.value = true;
     }
     try {
       await widget.names.ensureLoaded();
@@ -137,10 +131,8 @@ class _WatchlistScreenState extends State<WatchlistScreen> {
       }
     } catch (_) {}
     if (!mounted || seq != _previewSeq) return;
-    setState(() {
-      _previewLookupPending = false;
-      _resolvedPreview = _computePreviewSync(raw);
-    });
+    _previewLookupPending.value = false;
+    _resolvedPreview.value = _computePreviewSync(raw);
   }
 
   Future<void> _bootstrap() async {
@@ -214,6 +206,9 @@ class _WatchlistScreenState extends State<WatchlistScreen> {
       setState(() => _groups = nextGroups);
       await _persistGroups();
       _tickerCtrl.clear();
+      _inputMirror.value = '';
+      _resolvedPreview.value = '';
+      _previewLookupPending.value = false;
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('已加入 ${formatLabel(name, ticker)}')),
@@ -389,6 +384,9 @@ class _WatchlistScreenState extends State<WatchlistScreen> {
     _timer?.cancel();
     _tickerCtrl.removeListener(_onTickerInputChanged);
     _tickerCtrl.dispose();
+    _inputMirror.dispose();
+    _resolvedPreview.dispose();
+    _previewLookupPending.dispose();
     super.dispose();
   }
 
@@ -480,6 +478,7 @@ class _WatchlistScreenState extends State<WatchlistScreen> {
             children: [
               Expanded(
                 child: TextField(
+                  key: const ValueKey('watchlist_ticker_field'),
                   controller: _tickerCtrl,
                   decoration: const InputDecoration(
                     labelText: '代號或名稱',
@@ -500,44 +499,56 @@ class _WatchlistScreenState extends State<WatchlistScreen> {
             ],
           ),
           const SizedBox(height: 8),
-          if (_inputMirror.isEmpty)
-            Text(
-              '輸入代號或名稱觀察',
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
-                  ),
-            )
-          else
-            Material(
-              color: Theme.of(context).colorScheme.secondaryContainer,
-              borderRadius: BorderRadius.circular(10),
-              child: Padding(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                child: Row(
-                  children: [
-                    Icon(
-                      Icons.edit_note,
-                      size: 20,
-                      color:
-                          Theme.of(context).colorScheme.onSecondaryContainer,
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        '目前輸入：$_inputMirror',
-                        style: TextStyle(
-                          fontWeight: FontWeight.w700,
-                          color: Theme.of(context)
-                              .colorScheme
-                              .onSecondaryContainer,
-                        ),
+          ValueListenableBuilder<String>(
+            valueListenable: _inputMirror,
+            builder: (context, mirror, _) {
+              if (mirror.isEmpty) {
+                return Text(
+                  '輸入代號或名稱加入',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                );
+              }
+              return ValueListenableBuilder<String>(
+                valueListenable: _resolvedPreview,
+                builder: (context, preview, _) {
+                  final text = preview.isNotEmpty ? preview : mirror;
+                  return Material(
+                    color: Theme.of(context).colorScheme.secondaryContainer,
+                    borderRadius: BorderRadius.circular(10),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 12, vertical: 10),
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.edit_note,
+                            size: 20,
+                            color: Theme.of(context)
+                                .colorScheme
+                                .onSecondaryContainer,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              '目前輸入：',
+                              style: TextStyle(
+                                fontWeight: FontWeight.w700,
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .onSecondaryContainer,
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
                     ),
-                  ],
-                ),
-              ),
-            ),
+                  );
+                },
+              );
+            },
+          ),
           const SizedBox(height: 4),
           Align(
             alignment: Alignment.centerLeft,

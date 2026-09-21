@@ -41,9 +41,10 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
   bool _loading = true;
   bool _refreshing = false;
   final _tickerCtrl = TextEditingController();
-  String _inputMirror = '';
-  String _resolvedPreview = '';
-  bool _previewLookupPending = false;
+  /// Notifiers keep preview updates off setState so the TextField keeps focus.
+  final ValueNotifier<String> _inputMirror = ValueNotifier<String>('');
+  final ValueNotifier<String> _resolvedPreview = ValueNotifier<String>('');
+  final ValueNotifier<bool> _previewLookupPending = ValueNotifier<bool>(false);
   int _previewSeq = 0;
   final _priceCtrl = TextEditingController();
   final _sharesCtrl = TextEditingController();
@@ -94,11 +95,10 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
 
   void _onTickerInputChanged() {
     final v = _tickerCtrl.text.trim();
-    if (v == _inputMirror) return;
-    setState(() {
-      _inputMirror = v;
-      _resolvedPreview = _computePreviewSync(v);
-    });
+    if (v == _inputMirror.value) return;
+    // Notifiers only — setState here remounts siblings and collapses the keyboard.
+    _inputMirror.value = v;
+    _resolvedPreview.value = _computePreviewSync(v);
     _schedulePreviewLookup(v);
   }
 
@@ -115,10 +115,8 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
     final seq = ++_previewSeq;
     if (raw.isEmpty) {
       if (mounted && seq == _previewSeq) {
-        setState(() {
-          _previewLookupPending = false;
-          _resolvedPreview = '';
-        });
+        _previewLookupPending.value = false;
+        _resolvedPreview.value = '';
       }
       return;
     }
@@ -126,15 +124,13 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
     final needsFetch = code != null && widget.names.lookup(code) == null;
     if (!needsFetch) {
       if (mounted && seq == _previewSeq) {
-        setState(() {
-          _previewLookupPending = false;
-          _resolvedPreview = _computePreviewSync(raw);
-        });
+        _previewLookupPending.value = false;
+        _resolvedPreview.value = _computePreviewSync(raw);
       }
       return;
     }
     if (mounted && seq == _previewSeq) {
-      setState(() => _previewLookupPending = true);
+      _previewLookupPending.value = true;
     }
     try {
       await widget.names.ensureLoaded();
@@ -143,10 +139,8 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
       }
     } catch (_) {}
     if (!mounted || seq != _previewSeq) return;
-    setState(() {
-      _previewLookupPending = false;
-      _resolvedPreview = _computePreviewSync(raw);
-    });
+    _previewLookupPending.value = false;
+    _resolvedPreview.value = _computePreviewSync(raw);
   }
 
   Future<void> _bootstrap() async {
@@ -568,6 +562,9 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
     _timer?.cancel();
     _tickerCtrl.removeListener(_onTickerInputChanged);
     _tickerCtrl.dispose();
+    _inputMirror.dispose();
+    _resolvedPreview.dispose();
+    _previewLookupPending.dispose();
     _priceCtrl.dispose();
     _sharesCtrl.dispose();
     super.dispose();
@@ -600,26 +597,50 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
                 '可至「設置 → 備份／還原」匯出或匯入 JSON。',
           ),
 
-          if (_inputMirror.isNotEmpty) ...[
-            const SizedBox(height: 8),
-            Material(
-              color: Theme.of(context).colorScheme.secondaryContainer,
-              borderRadius: BorderRadius.circular(10),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                child: Text(
-                  _previewLookupPending &&
-                          (_resolvedPreview.isEmpty || !_resolvedPreview.contains('　'))
-                      ? '目前輸入：$_inputMirror　查詢名稱中…'
-                      : '目前輸入：${_resolvedPreview.isNotEmpty ? _resolvedPreview : _inputMirror}',
-                  style: TextStyle(
-                    fontWeight: FontWeight.w700,
-                    color: Theme.of(context).colorScheme.onSecondaryContainer,
-                  ),
+          ValueListenableBuilder<String>(
+            valueListenable: _inputMirror,
+            builder: (context, mirror, _) {
+              if (mirror.isEmpty) {
+                return const SizedBox.shrink();
+              }
+              return Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: ValueListenableBuilder<bool>(
+                  valueListenable: _previewLookupPending,
+                  builder: (context, pending, _) {
+                    return ValueListenableBuilder<String>(
+                      valueListenable: _resolvedPreview,
+                      builder: (context, preview, _) {
+                        final label = pending &&
+                                (preview.isEmpty || !preview.contains('　'))
+                            ? '目前輸入：　查詢名稱中…'
+                            : '目前輸入：';
+                        return Material(
+                          color: Theme.of(context).colorScheme.secondaryContainer,
+                          borderRadius: BorderRadius.circular(10),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 10,
+                            ),
+                            child: Text(
+                              label,
+                              style: TextStyle(
+                                fontWeight: FontWeight.w700,
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .onSecondaryContainer,
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                    );
+                  },
                 ),
-              ),
-            ),
-          ],
+              );
+            },
+          ),
 
           const SizedBox(height: 8),
           Row(
@@ -684,6 +705,7 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
             ),
           const SizedBox(height: 8),
           TextField(
+            key: const ValueKey('holdings_ticker_field'),
             controller: _tickerCtrl,
             decoration: const InputDecoration(labelText: '代號'),
           ),
