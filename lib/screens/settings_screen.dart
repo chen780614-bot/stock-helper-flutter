@@ -11,6 +11,7 @@ import '../services/rewarded_ads.dart';
 import '../services/names.dart';
 import '../services/storage.dart';
 import 'backup_screen.dart';
+import '../theme.dart';
 
 /// 設置：外觀、訂閱（關廣告）、獎勵廣告 24h、備份。
 class SettingsScreen extends StatefulWidget {
@@ -449,7 +450,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
             ),
             const SizedBox(height: 14),
-            FilledButton.tonalIcon(
+            FilledButton.icon(
+              style: appSecondaryButtonStyle(Theme.of(context).colorScheme),
+              
               onPressed: canWatch ? _watchRewarded : null,
               icon: _busy
                   ? const SizedBox(
@@ -487,7 +490,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
             style: Theme.of(context).textTheme.bodyMedium,
           ),
           const SizedBox(height: 12),
-          FilledButton.tonalIcon(
+          FilledButton.icon(
+            style: appSecondaryButtonStyle(Theme.of(context).colorScheme),
+            
             onPressed: _dbBusy ? null : _updateSecuritiesDb,
             icon: _dbBusy
                 ? const SizedBox(

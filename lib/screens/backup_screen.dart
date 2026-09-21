@@ -9,6 +9,7 @@ import 'package:share_plus/share_plus.dart';
 
 import '../services/backup.dart';
 import '../services/storage.dart';
+import '../theme.dart';
 
 /// JSON 備份匯出／匯入（業務資料：觀察名單、持倉、賣出紀錄、主題）。
 class BackupScreen extends StatefulWidget {
@@ -223,6 +224,7 @@ class _BackupScreenState extends State<BackupScreen> {
           ),
           const SizedBox(height: 16),
           FilledButton.icon(
+            style: appPrimaryButtonStyle(Theme.of(context).colorScheme),
             onPressed: _busy ? null : _export,
             icon: _busy
                 ? const SizedBox(
@@ -266,6 +268,7 @@ class _BackupScreenState extends State<BackupScreen> {
           ),
           const SizedBox(height: 12),
           OutlinedButton.icon(
+            style: appOutlineButtonStyle(Theme.of(context).colorScheme),
             onPressed: _busy ? null : _import,
             icon: const Icon(Icons.download_outlined),
             label: const Text('匯入／還原（選擇 JSON）'),

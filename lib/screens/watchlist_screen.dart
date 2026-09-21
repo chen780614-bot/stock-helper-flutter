@@ -360,10 +360,7 @@ class _WatchlistScreenState extends State<WatchlistScreen> {
             child: const Text('取消'),
           ),
           FilledButton(
-            style: FilledButton.styleFrom(
-              backgroundColor: Theme.of(ctx).colorScheme.error,
-              foregroundColor: Theme.of(ctx).colorScheme.onError,
-            ),
+            style: appPrimaryButtonStyle(Theme.of(ctx).colorScheme, danger: true),
             onPressed: () => Navigator.pop(ctx, true),
             child: const Text('刪除群組'),
           ),

@@ -242,9 +242,7 @@ class _MonthDetailPageState extends State<_MonthDetailPage> {
             child: const Text('取消'),
           ),
           FilledButton(
-            style: FilledButton.styleFrom(
-              backgroundColor: Theme.of(ctx).colorScheme.error,
-            ),
+            style: appPrimaryButtonStyle(Theme.of(ctx).colorScheme, danger: true),
             onPressed: () => Navigator.pop(ctx, true),
             child: const Text('刪除並還原股數'),
           ),
@@ -283,9 +281,7 @@ class _MonthDetailPageState extends State<_MonthDetailPage> {
             child: const Text('取消'),
           ),
           FilledButton(
-            style: FilledButton.styleFrom(
-              backgroundColor: Theme.of(ctx).colorScheme.error,
-            ),
+            style: appPrimaryButtonStyle(Theme.of(ctx).colorScheme, danger: true),
             onPressed: () => Navigator.pop(ctx, true),
             child: const Text('刪除'),
           ),

@@ -382,7 +382,8 @@ class _HomeScreenState extends State<HomeScreen> {
                       const SizedBox(height: 8),
                       Align(
                         alignment: Alignment.centerRight,
-                        child: FilledButton.tonalIcon(
+                        child: FilledButton.icon(
+                          style: appSecondaryButtonStyle(Theme.of(context).colorScheme),
                           onPressed: () => _recordIncomeFromEvent(e, row.shares),
                           icon: const Icon(Icons.savings_outlined, size: 18),
                           label: const Text('記入總收益'),
