@@ -31,9 +31,10 @@ class BackupScreen extends StatefulWidget {
 class _BackupScreenState extends State<BackupScreen> {
   late final BackupService _backup = BackupService(widget.storage);
   bool _busy = false;
-  BackupConflictStrategy _strategy = BackupConflictStrategy.skip;
+  BackupConflictStrategy _strategy = BackupConflictStrategy.replaceAll;
 
   String _strategyLabel(BackupConflictStrategy s) => switch (s) {
+        BackupConflictStrategy.replaceAll => '完整還原（取代本機資料）',
         BackupConflictStrategy.skip => '跳過（保留本機）',
         BackupConflictStrategy.overwrite => '覆蓋（以備份為準）',
         BackupConflictStrategy.saveAsCopy => '另存（新 UUID）',
@@ -219,7 +220,7 @@ class _BackupScreenState extends State<BackupScreen> {
           ),
           const SizedBox(height: 4),
           Text(
-            '匯出／匯入觀察名單、持倉、賣出紀錄與主題設定。不含名稱快取等暫存資料。檔案僅透過系統分享／選檔，不會自動存取其他位置。',
+            '匯出／匯入觀察名單、持倉分組、賣出／股利與主題。預設「完整還原」會以備份取代本機業務資料。不含名稱快取。檔案僅透過系統分享／選檔。',
             style: Theme.of(context).textTheme.bodySmall,
           ),
           const SizedBox(height: 16),
@@ -241,9 +242,9 @@ class _BackupScreenState extends State<BackupScreen> {
           SegmentedButton<BackupConflictStrategy>(
             segments: const [
               ButtonSegment(
-                value: BackupConflictStrategy.skip,
-                label: Text('跳過'),
-                icon: Icon(Icons.skip_next_outlined),
+                value: BackupConflictStrategy.replaceAll,
+                label: Text('完整還原'),
+                icon: Icon(Icons.restore_outlined),
               ),
               ButtonSegment(
                 value: BackupConflictStrategy.overwrite,
@@ -251,9 +252,9 @@ class _BackupScreenState extends State<BackupScreen> {
                 icon: Icon(Icons.find_replace_outlined),
               ),
               ButtonSegment(
-                value: BackupConflictStrategy.saveAsCopy,
-                label: Text('另存'),
-                icon: Icon(Icons.copy_all_outlined),
+                value: BackupConflictStrategy.skip,
+                label: Text('跳過'),
+                icon: Icon(Icons.skip_next_outlined),
               ),
             ],
             selected: {_strategy},

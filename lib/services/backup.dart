@@ -30,8 +30,9 @@ const _privilegeKeys = {
 };
 
 enum BackupConflictStrategy {
-  skip, // 跳過
-  overwrite, // 覆蓋
+  replaceAll, // 完整還原（以備份取代本機）
+  skip, // 跳過已存在
+  overwrite, // 覆蓋已存在
   saveAsCopy, // 另存一份
 }
 
@@ -338,7 +339,12 @@ Map<String, dynamic> migratePayloadToV1(Map<String, dynamic> raw, int fromVersio
 BackupEnvelope parseAndValidateBackupJson(String rawJson) {
   late final dynamic decoded;
   try {
-    decoded = jsonDecode(rawJson);
+    var s = rawJson.trim();
+    // Strip UTF-8 BOM if present (common after Windows editors / share).
+    if (s.isNotEmpty && s.codeUnitAt(0) == 0xFEFF) {
+      s = s.substring(1);
+    }
+    decoded = jsonDecode(s);
   } catch (_) {
     throw BackupException('備份檔不是有效的 JSON');
   }
@@ -361,35 +367,25 @@ BackupEnvelope parseAndValidateBackupJson(String rawJson) {
   if (payloadRaw is! Map) {
     throw BackupException('缺少或損毀的 payload');
   }
-  final migrated =
-      migratePayloadToV1(Map<String, dynamic>.from(payloadRaw), schemaVersion);
   final expected = root['checksum'] as String?;
   if (expected == null || expected.isEmpty) {
     throw BackupException('缺少 checksum');
   }
-  final actual = sha256HexOfCanonicalPayload(migrated);
-  if (actual.toLowerCase() != expected.toLowerCase()) {
-    // Also accept checksum of original payload before migrate if schema==1
-    // and identical structure — but after migrate ids may change if missing.
-    // Recompute against pre-migrate stripped payload for schema==1 files that
-    // already had ids.
-    final stripped =
-        stripPrivilegeFields(Map<String, dynamic>.from(payloadRaw));
-    // Drop excluded keys that migrate removes, without rewriting ids.
-    stripped.remove('namesCache');
-    stripped.remove('tw_names_cache');
-    stripped.remove('quoteCache');
-    stripped.remove('quotes');
-    stripped.remove('logs');
-    stripped.remove('tokens');
-    stripped.remove('ads');
-    final alt = sha256HexOfCanonicalPayload(stripped);
-    if (alt.toLowerCase() != expected.toLowerCase() &&
-        actual.toLowerCase() != expected.toLowerCase()) {
-      throw BackupException('checksum 驗證失敗（檔案可能已損毀或被竄改）');
-    }
+  // Verify checksum against the payload as stored (before id backfill), then
+  // migrate. Accept either raw or privilege-stripped form for older files.
+  final rawPayload = Map<String, dynamic>.from(payloadRaw);
+  final stripped = stripPrivilegeFields(rawPayload);
+  for (final k in ['namesCache','tw_names_cache','quoteCache','quotes','logs','tokens','ads']) {
+    stripped.remove(k);
   }
-  final payload = BackupPayload.fromJson(migrated);
+  final actualRaw = sha256HexOfCanonicalPayload(rawPayload);
+  final actualStripped = sha256HexOfCanonicalPayload(stripped);
+  if (actualRaw.toLowerCase() != expected.toLowerCase() &&
+      actualStripped.toLowerCase() != expected.toLowerCase()) {
+    throw BackupException('checksum 驗證失敗（檔案可能已損毀或被竄改）');
+  }
+  final migrated = migratePayloadToV1(stripped, schemaVersion);
+  final payload = normalizePayloadGroups(BackupPayload.fromJson(migrated));
   return BackupEnvelope(
     format: format!,
     schemaVersion: schemaVersion,
@@ -440,11 +436,109 @@ bool _incomeEqual(IncomeRecord a, IncomeRecord b) =>
     a.note == b.note &&
     a.kind == b.kind;
 
+
+List<WatchGroup> _groupsFromWatchlist(List<WatchItem> items) {
+  if (items.isEmpty) {
+    return [
+      WatchGroup(id: newEntityId(), name: '預設清單', items: const []),
+    ];
+  }
+  return [
+    WatchGroup(id: newEntityId(), name: '預設清單', items: List<WatchItem>.from(items)),
+  ];
+}
+
+List<HoldingGroup> _groupsFromHoldings(List<Holding> items) {
+  if (items.isEmpty) {
+    return [
+      HoldingGroup(id: newEntityId(), name: '預設持倉', items: const []),
+    ];
+  }
+  return [
+    HoldingGroup(id: newEntityId(), name: '預設持倉', items: List<Holding>.from(items)),
+  ];
+}
+
+List<WatchItem> _flattenWatchGroups(List<WatchGroup> groups) {
+  final out = <WatchItem>[];
+  final seen = <String>{};
+  for (final g in groups) {
+    for (final w in g.items) {
+      if (seen.add(w.ticker)) out.add(w);
+    }
+  }
+  return out;
+}
+
+List<Holding> _flattenHoldingGroups(List<HoldingGroup> groups) {
+  final out = <Holding>[];
+  for (final g in groups) {
+    out.addAll(g.items);
+  }
+  return out;
+}
+
+BackupPayload normalizePayloadGroups(BackupPayload p) {
+  var watchGroups = p.watchGroups;
+  var holdingGroups = p.holdingGroups;
+  var watchlist = p.watchlist;
+  var holdings = p.holdings;
+
+  if (watchGroups.isEmpty && watchlist.isNotEmpty) {
+    watchGroups = _groupsFromWatchlist(watchlist);
+  }
+  if (holdingGroups.isEmpty && holdings.isNotEmpty) {
+    holdingGroups = _groupsFromHoldings(holdings);
+  }
+  // Groups are canonical for UI — keep flat lists aligned.
+  if (watchGroups.isNotEmpty) {
+    watchlist = _flattenWatchGroups(watchGroups);
+  }
+  if (holdingGroups.isNotEmpty) {
+    holdings = _flattenHoldingGroups(holdingGroups);
+  }
+  return BackupPayload(
+    watchlist: watchlist,
+    holdings: holdings,
+    sells: p.sells,
+    incomes: p.incomes,
+    themeMode: p.themeMode,
+    watchGroups: watchGroups,
+    holdingGroups: holdingGroups,
+    activeWatchGroupId: p.activeWatchGroupId ??
+        (watchGroups.isNotEmpty ? watchGroups.first.id : null),
+    activeHoldingGroupId: p.activeHoldingGroupId ??
+        (holdingGroups.isNotEmpty ? holdingGroups.first.id : null),
+  );
+}
+
 ImportPreview previewImport({
   required LocalBackupSnapshot local,
   required BackupPayload incoming,
   required BackupConflictStrategy strategy,
 }) {
+  if (strategy == BackupConflictStrategy.replaceAll) {
+    final n = normalizePayloadGroups(incoming);
+    final watchGroups = n.watchGroups.isNotEmpty ? n.watchGroups : _groupsFromWatchlist(n.watchlist);
+    final holdingGroups = n.holdingGroups.isNotEmpty ? n.holdingGroups : _groupsFromHoldings(n.holdings);
+    final w = _flattenWatchGroups(watchGroups);
+    final h = _flattenHoldingGroups(holdingGroups);
+    return ImportPreview(
+      watchAdded: w.length,
+      watchChanged: 0,
+      watchSkipped: 0,
+      holdingsAdded: h.length,
+      holdingsChanged: 0,
+      holdingsSkipped: 0,
+      sellsAdded: n.sells.length,
+      sellsChanged: 0,
+      sellsSkipped: 0,
+      incomesAdded: n.incomes.length,
+      incomesChanged: 0,
+      incomesSkipped: 0,
+      themeWillChange: themeModeToBackup(local.themeMode) != n.themeMode,
+    );
+  }
   var wAdd = 0, wChg = 0, wSkip = 0;
   var hAdd = 0, hChg = 0, hSkip = 0;
   var sAdd = 0, sChg = 0, sSkip = 0;
@@ -460,6 +554,8 @@ ImportPreview previewImport({
       wSkip++;
     } else {
       switch (strategy) {
+        case BackupConflictStrategy.replaceAll:
+          wChg++;
         case BackupConflictStrategy.skip:
           wSkip++;
         case BackupConflictStrategy.overwrite:
@@ -479,6 +575,8 @@ ImportPreview previewImport({
       hSkip++;
     } else {
       switch (strategy) {
+        case BackupConflictStrategy.replaceAll:
+          hChg++;
         case BackupConflictStrategy.skip:
           hSkip++;
         case BackupConflictStrategy.overwrite:
@@ -498,6 +596,8 @@ ImportPreview previewImport({
       sSkip++;
     } else {
       switch (strategy) {
+        case BackupConflictStrategy.replaceAll:
+          sChg++;
         case BackupConflictStrategy.skip:
           sSkip++;
         case BackupConflictStrategy.overwrite:
@@ -517,6 +617,8 @@ ImportPreview previewImport({
       iSkip++;
     } else {
       switch (strategy) {
+        case BackupConflictStrategy.replaceAll:
+          iChg++;
         case BackupConflictStrategy.skip:
           iSkip++;
         case BackupConflictStrategy.overwrite:
@@ -529,6 +631,7 @@ ImportPreview previewImport({
 
   final themeWillChange = strategy != BackupConflictStrategy.skip &&
       themeModeToBackup(local.themeMode) != incoming.themeMode;
+  // replaceAll always applies incoming theme
 
   return ImportPreview(
     watchAdded: wAdd,
@@ -553,6 +656,28 @@ LocalBackupSnapshot mergeImport({
   required BackupPayload incoming,
   required BackupConflictStrategy strategy,
 }) {
+  final normalized = normalizePayloadGroups(incoming);
+  if (strategy == BackupConflictStrategy.replaceAll) {
+    final watchGroups = normalized.watchGroups.isNotEmpty
+        ? normalized.watchGroups
+        : _groupsFromWatchlist(normalized.watchlist);
+    final holdingGroups = normalized.holdingGroups.isNotEmpty
+        ? normalized.holdingGroups
+        : _groupsFromHoldings(normalized.holdings);
+    return LocalBackupSnapshot(
+      watchlist: _flattenWatchGroups(watchGroups),
+      holdings: _flattenHoldingGroups(holdingGroups),
+      sells: List<SellRecord>.from(normalized.sells),
+      incomes: List<IncomeRecord>.from(normalized.incomes),
+      themeMode: themeModeFromBackup(normalized.themeMode),
+      watchGroups: watchGroups,
+      holdingGroups: holdingGroups,
+      activeWatchGroupId: normalized.activeWatchGroupId ?? watchGroups.first.id,
+      activeHoldingGroupId:
+          normalized.activeHoldingGroupId ?? holdingGroups.first.id,
+    );
+  }
+
   // Watchlist
   final watchById = {for (final e in local.watchlist) e.id: e};
   final watchByTicker = {for (final e in local.watchlist) e.ticker: e};
@@ -570,6 +695,8 @@ LocalBackupSnapshot mergeImport({
       continue;
     }
     switch (strategy) {
+      case BackupConflictStrategy.replaceAll:
+        break;
       case BackupConflictStrategy.skip:
         break;
       case BackupConflictStrategy.overwrite:
@@ -605,6 +732,8 @@ LocalBackupSnapshot mergeImport({
       continue;
     }
     switch (strategy) {
+      case BackupConflictStrategy.replaceAll:
+        break;
       case BackupConflictStrategy.skip:
         break;
       case BackupConflictStrategy.overwrite:
@@ -629,6 +758,8 @@ LocalBackupSnapshot mergeImport({
       continue;
     }
     switch (strategy) {
+      case BackupConflictStrategy.replaceAll:
+        break;
       case BackupConflictStrategy.skip:
         break;
       case BackupConflictStrategy.overwrite:
@@ -662,6 +793,8 @@ LocalBackupSnapshot mergeImport({
       continue;
     }
     switch (strategy) {
+      case BackupConflictStrategy.replaceAll:
+        break;
       case BackupConflictStrategy.skip:
         break;
       case BackupConflictStrategy.overwrite:
@@ -724,9 +857,11 @@ class BackupService {
 
     final watchGroups = await storage.loadWatchGroups();
     final holdingGroups = await storage.loadHoldingGroups();
+    // Groups are canonical — export flat lists derived from them so restore
+    // round-trips what the UI actually shows.
     return LocalBackupSnapshot(
-      watchlist: watchFixed,
-      holdings: await storage.loadHoldings(),
+      watchlist: _flattenWatchGroups(watchGroups),
+      holdings: _flattenHoldingGroups(holdingGroups),
       sells: await storage.loadSells(),
       incomes: await storage.loadIncomes(),
       themeMode: await storage.loadThemeMode(),
@@ -784,24 +919,40 @@ class BackupService {
       strategy: strategy,
     );
     try {
-      await storage.saveWatchlist(merged.watchlist);
-      await storage.saveHoldings(merged.holdings);
+      // Groups are canonical for the UI. Always write groups (synthesize from
+      // flat lists when an older backup has no groups), which also syncs the
+      // legacy flat keys inside AppStorage.
+      final watchGroups = merged.watchGroups.isNotEmpty
+          ? merged.watchGroups
+          : _groupsFromWatchlist(merged.watchlist);
+      final holdingGroups = merged.holdingGroups.isNotEmpty
+          ? merged.holdingGroups
+          : _groupsFromHoldings(merged.holdings);
+
+      await storage.saveWatchGroups(watchGroups);
+      await storage.saveHoldingGroups(holdingGroups);
       await storage.saveSells(merged.sells);
       await storage.saveIncomes(merged.incomes);
       await storage.saveThemeMode(merged.themeMode);
-      if (merged.watchGroups.isNotEmpty) {
-        await storage.saveWatchGroups(merged.watchGroups);
-      }
-      if (merged.holdingGroups.isNotEmpty) {
-        await storage.saveHoldingGroups(merged.holdingGroups);
-      }
-      if (merged.activeWatchGroupId != null) {
-        await storage.saveActiveWatchGroupId(merged.activeWatchGroupId!);
-      }
-      if (merged.activeHoldingGroupId != null) {
-        await storage.saveActiveHoldingGroupId(merged.activeHoldingGroupId!);
-      }
-      return merged;
+
+      final activeWatch =
+          merged.activeWatchGroupId ?? watchGroups.first.id;
+      final activeHold =
+          merged.activeHoldingGroupId ?? holdingGroups.first.id;
+      await storage.saveActiveWatchGroupId(activeWatch);
+      await storage.saveActiveHoldingGroupId(activeHold);
+
+      return LocalBackupSnapshot(
+        watchlist: _flattenWatchGroups(watchGroups),
+        holdings: _flattenHoldingGroups(holdingGroups),
+        sells: merged.sells,
+        incomes: merged.incomes,
+        themeMode: merged.themeMode,
+        watchGroups: watchGroups,
+        holdingGroups: holdingGroups,
+        activeWatchGroupId: activeWatch,
+        activeHoldingGroupId: activeHold,
+      );
     } catch (e) {
       // Rollback
       try {

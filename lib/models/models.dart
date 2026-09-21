@@ -29,16 +29,23 @@ class Holding {
         'note': note,
       };
 
-  factory Holding.fromJson(Map<String, dynamic> j) => Holding(
-        id: (j['id'] as String?)?.trim().isNotEmpty == true
-            ? j['id'] as String
-            : '',
-        ticker: j['ticker'] as String,
-        name: (j['name'] as String?) ?? '',
-        buyPrice: (j['buyPrice'] as num).toDouble(),
-        shares: (j['shares'] as num).toDouble(),
-        note: (j['note'] as String?) ?? '',
-      );
+  factory Holding.fromJson(Map<String, dynamic> j) {
+    num? price = j['buyPrice'] as num?;
+    price ??= j['avgCost'] as num?;
+    price ??= j['price'] as num?;
+    price ??= j['cost'] as num?;
+    final sharesRaw = j['shares'] as num? ?? j['qty'] as num? ?? 0;
+    return Holding(
+      id: (j['id'] as String?)?.trim().isNotEmpty == true
+          ? j['id'] as String
+          : '',
+      ticker: (j['ticker'] as String?) ?? '',
+      name: (j['name'] as String?) ?? '',
+      buyPrice: (price ?? 0).toDouble(),
+      shares: sharesRaw.toDouble(),
+      note: (j['note'] as String?) ?? '',
+    );
+  }
 
   Holding copyWith({
     String? id,
