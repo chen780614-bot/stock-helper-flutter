@@ -7,6 +7,7 @@ import '../models/models.dart';
 import '../services/dividends.dart';
 import '../services/names.dart';
 import '../services/quotes.dart';
+import '../services/portfolio_math.dart';
 import '../services/storage.dart';
 import '../services/ticker.dart';
 import '../theme.dart';
@@ -82,8 +83,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _reload() async {
     setState(() => _refreshing = true);
-    final raw = await widget.storage.loadHoldings();
-    final items = consolidateHoldings(raw);
+    // Same universe as 成本損益 (active holding group).
+    final items = await widget.storage.loadPortfolioHoldings(activeGroupOnly: true);
     if (!mounted) return;
     setState(() {
       _holdings = items;
@@ -134,39 +135,13 @@ class _HomeScreenState extends State<HomeScreen> {
       return const Center(child: CircularProgressIndicator());
     }
 
-    double totalCost = 0;
-    double totalMv = 0;
-    var hasMv = false;
-    double? dayPnl;
-    var hasDay = false;
-
-    final weights = <({Holding h, double mv, double weight})>[];
-
-    for (final h in _holdings) {
-      totalCost += h.cost;
-      final q = _quotes[h.ticker];
-      if (q != null && q.ok) {
-        final mv = q.price * h.shares;
-        totalMv += mv;
-        hasMv = true;
-        weights.add((h: h, mv: mv, weight: 0));
-        final prev = q.previousClose;
-        if (prev != null && prev > 0) {
-          dayPnl = (dayPnl ?? 0) + (q.price - prev) * h.shares;
-          hasDay = true;
-        }
-      }
-    }
-
-    if (hasMv && totalMv > 0) {
-      for (var i = 0; i < weights.length; i++) {
-        final w = weights[i];
-        weights[i] = (h: w.h, mv: w.mv, weight: w.mv / totalMv);
-      }
-      weights.sort((a, b) => b.weight.compareTo(a.weight));
-    }
-
-    final unrealized = hasMv ? totalMv - totalCost : null;
+    final totals = computePortfolioTotals(holdings: _holdings, quotes: _quotes);
+    final totalMv = totals.totalMarketValue;
+    final hasMv = totals.hasMarketValue;
+    final dayPnl = totals.dayPnl;
+    final hasDay = totals.hasDayPnl;
+    final unrealized = totals.unrealizedPnl;
+    final weights = computePortfolioWeights(holdings: _holdings, quotes: _quotes);
     final top3 = weights.take(3).toList();
 
     return RefreshIndicator(
@@ -180,7 +155,7 @@ class _HomeScreenState extends State<HomeScreen> {
           sectionHeader(
             context,
             '首頁總覽',
-            subtitle: '依目前持倉與報價彙總；盤中即時、收盤後用收盤價。下拉可重新整理。',
+            subtitle: '與「成本損益」目前群組同一套計算；盤中即時、收盤後用收盤價。下拉可重新整理。',
           ),
           const SizedBox(height: 8),
           if (_holdings.isEmpty)
@@ -206,7 +181,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   unrealized == null
                       ? '—'
                       : '${_money.format(unrealized)}'
-                          '${totalCost > 0 ? '（${NumberFormat('+0.00%;-0.00%').format(unrealized / totalCost)}）' : ''}',
+                          '${totals.unrealizedPnlPct != null ? '（${NumberFormat('+0.00%;-0.00%').format(totals.unrealizedPnlPct)}）' : ''}',
                   color: unrealized == null
                       ? null
                       : pnlColor(context, unrealized),
@@ -243,18 +218,19 @@ class _HomeScreenState extends State<HomeScreen> {
               ...top3.asMap().entries.map((e) {
                 final i = e.key;
                 final row = e.value;
-                final name = row.h.name.isNotEmpty
-                    ? row.h.name
-                    : widget.names.resolveName(row.h.ticker);
+                final h = row.holding;
+                final name = h.name.isNotEmpty
+                    ? h.name
+                    : widget.names.resolveName(h.ticker);
                 return Card(
                   child: ListTile(
                     leading: CircleAvatar(child: Text('${i + 1}')),
                     title: Text(
-                      formatLabel(name, row.h.ticker),
+                      formatLabel(name, h.ticker),
                       style: const TextStyle(fontWeight: FontWeight.w600),
                     ),
                     subtitle: Text(
-                      '市值 ${_money.format(row.mv)}｜權重 ${_pct.format(row.weight)}',
+                      '市值 ${_money.format(row.marketValue)}｜權重 ${_pct.format(row.weight)}',
                     ),
                   ),
                 );

@@ -252,9 +252,7 @@ class _MonthDetailPageState extends State<_MonthDetailPage> {
       ),
     );
     if (ok != true) return;
-    final holdings = await widget.storage.loadHoldings();
-    final restored = restoreHoldingFromSell(holdings, r);
-    await widget.storage.saveHoldings(consolidateHoldings(restored));
+    await widget.storage.restoreSellIntoActiveGroup(r);
     await widget.storage.deleteSell(r.id);
     await widget.onChanged();
     await _reload();

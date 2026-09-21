@@ -80,9 +80,54 @@ class AppStorage {
   }
 
   Future<void> saveHoldings(List<Holding> items) async {
+    final consolidated = consolidateHoldings(items);
     final p = await SharedPreferences.getInstance();
     await p.setString(
-        _holdKey, jsonEncode(items.map((e) => e.toJson()).toList()));
+        _holdKey, jsonEncode(consolidated.map((e) => e.toJson()).toList()));
+  }
+
+  /// Holdings for portfolio math: groups are canonical (成本損益);
+  /// [activeGroupOnly] matches the group currently shown there.
+  Future<List<Holding>> loadPortfolioHoldings({bool activeGroupOnly = true}) async {
+    final groups = await loadHoldingGroups();
+    if (groups.isEmpty) {
+      return consolidateHoldings(await loadHoldings());
+    }
+    if (!activeGroupOnly) {
+      final flat = <Holding>[for (final g in groups) ...g.items];
+      return consolidateHoldings(flat);
+    }
+    final activeId = await loadActiveHoldingGroupId();
+    HoldingGroup g = groups.first;
+    if (activeId != null) {
+      for (final x in groups) {
+        if (x.id == activeId) {
+          g = x;
+          break;
+        }
+      }
+    }
+    return List<Holding>.from(g.items);
+  }
+
+  /// Restore shares from an undone sell into the active holding group (canonical).
+  Future<void> restoreSellIntoActiveGroup(SellRecord record) async {
+    final groups = await loadHoldingGroups();
+    final activeId = await loadActiveHoldingGroupId();
+    if (groups.isEmpty) {
+      final restored = restoreHoldingFromSell(await loadHoldings(), record);
+      await saveHoldings(consolidateHoldings(restored));
+      return;
+    }
+    var idx = 0;
+    if (activeId != null) {
+      final i = groups.indexWhere((g) => g.id == activeId);
+      if (i >= 0) idx = i;
+    }
+    final nextItems = restoreHoldingFromSell(groups[idx].items, record);
+    final next = [...groups];
+    next[idx] = groups[idx].copyWith(items: nextItems);
+    await saveHoldingGroups(next);
   }
 
   Future<List<SellRecord>> loadSells() async {

@@ -5,6 +5,7 @@ import '../models/models.dart';
 import '../services/ids.dart';
 import '../services/names.dart';
 import '../services/quotes.dart';
+import '../services/portfolio_math.dart';
 import '../services/storage.dart';
 import '../services/ticker.dart';
 import '../theme.dart';
@@ -582,20 +583,13 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
     final cs = Theme.of(context).colorScheme;
     final g = _activeGroup;
 
-    double totalCost = 0;
-    double totalMv = 0;
-    var hasMv = false;
-    for (final h in _items) {
-      totalCost += h.cost;
-      final q = _quotes[h.ticker];
-      if (q != null && q.ok) {
-        totalMv += q.price * h.shares;
-        hasMv = true;
-      }
-    }
-    final totalPnl = hasMv ? totalMv - totalCost : null;
-    final totalPnlPct =
-        (totalPnl != null && totalCost > 0) ? totalPnl / totalCost : null;
+    // Same shared math as 首頁 (active group holdings + quotes).
+    final totals = computePortfolioTotals(holdings: _items, quotes: _quotes);
+    final totalCost = totals.totalCost;
+    final totalMv = totals.totalMarketValue;
+    final hasMv = totals.hasMarketValue;
+    final totalPnl = totals.unrealizedPnl;
+    final totalPnlPct = totals.unrealizedPnlPct;
 
     return RefreshIndicator(
       onRefresh: _reloadHoldings,
