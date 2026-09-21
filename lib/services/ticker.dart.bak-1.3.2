@@ -1,0 +1,39 @@
+﻿String normalizeTicker(String raw) {
+  final s = raw.trim().toUpperCase();
+  if (s.isEmpty) {
+    throw ArgumentError('股票代號不可為空');
+  }
+  final twSuffix = RegExp(r'^(\d{4,6})\.(TW|TWO)$');
+  final m1 = twSuffix.firstMatch(s);
+  if (m1 != null) return s;
+
+  final pureDigits = RegExp(r'^\d{4,6}$');
+  if (pureDigits.hasMatch(s)) return '$s.TW';
+
+  final alias = RegExp(r'^(\d{4,6})[\s\-_]+(TW|TWO)$');
+  final m2 = alias.firstMatch(s);
+  if (m2 != null) return '${m2.group(1)}.${m2.group(2)}';
+
+  final us = RegExp(r'^[A-Z][A-Z0-9.\-]{0,9}$');
+  if (us.hasMatch(s)) return s;
+
+  throw ArgumentError('無法辨識的股票代號：$raw');
+}
+
+bool isTaiwanTicker(String ticker) {
+  return RegExp(r'\.(TW|TWO)$').hasMatch(ticker.toUpperCase());
+}
+
+String? extractTwCode(String ticker) {
+  final s = ticker.trim().toUpperCase();
+  final m = RegExp(r'^(\d{4,6})\.(TW|TWO)$').firstMatch(s);
+  if (m != null) return m.group(1);
+  if (RegExp(r'^\d{4,6}$').hasMatch(s)) return s;
+  return null;
+}
+
+String formatLabel(String name, String ticker) {
+  final n = name.trim();
+  if (n.isEmpty) return ticker;
+  return '$n（$ticker）';
+}

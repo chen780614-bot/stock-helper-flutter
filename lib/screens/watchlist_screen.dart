@@ -1,0 +1,620 @@
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
+import '../models/models.dart';
+import '../services/ids.dart';
+import '../services/names.dart';
+import '../services/quotes.dart';
+import '../services/storage.dart';
+import '../services/ticker.dart';
+import '../theme.dart';
+
+class WatchlistScreen extends StatefulWidget {
+  const WatchlistScreen({
+    super.key,
+    required this.storage,
+    required this.names,
+    required this.quotes,
+    this.active = true,
+  });
+
+  final AppStorage storage;
+  final NamesService names;
+  final QuotesService quotes;
+  final bool active;
+
+  @override
+  State<WatchlistScreen> createState() => _WatchlistScreenState();
+}
+
+class _WatchlistScreenState extends State<WatchlistScreen> {
+  /// Soft UX caps for everyone (membership removed).
+  static const int _symbolSoftCap = 500;
+  static const int _groupsSoftCap = 50;
+
+  List<WatchGroup> _groups = [];
+  String? _activeGroupId;
+  Map<String, Quote> _quotes = {};
+  bool _loading = true;
+  bool _refreshing = false;
+  Timer? _timer;
+  final _tickerCtrl = TextEditingController();
+  String _inputMirror = '';
+  String _resolvedPreview = '';
+  bool _previewLookupPending = false;
+  int _previewSeq = 0;
+  final _money = NumberFormat('#,##0.##');
+
+  WatchGroup? get _activeGroup {
+    if (_groups.isEmpty) return null;
+    final id = _activeGroupId;
+    if (id != null) {
+      for (final g in _groups) {
+        if (g.id == id) return g;
+      }
+    }
+    return _groups.first;
+  }
+
+  List<WatchItem> get _items => _activeGroup?.items ?? const [];
+
+  @override
+  void initState() {
+    super.initState();
+    _tickerCtrl.addListener(_onTickerInputChanged);
+    _bootstrap();
+    if (widget.active) _armTimer();
+  }
+
+  @override
+  void didUpdateWidget(covariant WatchlistScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.active && !oldWidget.active) {
+      _refreshQuotes(force: true);
+      _armTimer();
+    } else if (!widget.active && oldWidget.active) {
+      _timer?.cancel();
+      _timer = null;
+    }
+  }
+
+  void _armTimer() {
+    _timer?.cancel();
+    _timer = Timer.periodic(const Duration(seconds: 10), (_) {
+      if (!mounted || !widget.active || _refreshing) return;
+      _refreshQuotes(force: true);
+    });
+  }
+
+  void _onTickerInputChanged() {
+    final v = _tickerCtrl.text.trim();
+    if (v == _inputMirror) return;
+    setState(() {
+      _inputMirror = v;
+      _resolvedPreview = _computePreviewSync(v);
+    });
+    _schedulePreviewLookup(v);
+  }
+
+  String _computePreviewSync(String raw) {
+    if (raw.isEmpty) return '';
+    try {
+      return widget.names.previewLabelForInput(raw);
+    } catch (_) {
+      return raw;
+    }
+  }
+
+  Future<void> _schedulePreviewLookup(String raw) async {
+    final seq = ++_previewSeq;
+    if (raw.isEmpty) {
+      if (mounted && seq == _previewSeq) {
+        setState(() {
+          _previewLookupPending = false;
+          _resolvedPreview = '';
+        });
+      }
+      return;
+    }
+    final code = extractTwCode(raw);
+    final needsFetch = code != null && widget.names.lookup(code) == null;
+    if (!needsFetch) {
+      if (mounted && seq == _previewSeq) {
+        setState(() {
+          _previewLookupPending = false;
+          _resolvedPreview = _computePreviewSync(raw);
+        });
+      }
+      return;
+    }
+    if (mounted && seq == _previewSeq) {
+      setState(() => _previewLookupPending = true);
+    }
+    try {
+      await widget.names.ensureLoaded();
+      if (widget.names.lookup(code!) == null) {
+        await widget.names.refreshFromMarkets();
+      }
+    } catch (_) {}
+    if (!mounted || seq != _previewSeq) return;
+    setState(() {
+      _previewLookupPending = false;
+      _resolvedPreview = _computePreviewSync(raw);
+    });
+  }
+
+  Future<void> _bootstrap() async {
+    await widget.names.ensureLoaded();
+    await widget.names.refreshFromMarkets();
+    final groups = await widget.storage.loadWatchGroups();
+    final activeId = await widget.storage.loadActiveWatchGroupId();
+    setState(() {
+      _groups = groups;
+      _activeGroupId = activeId ?? (groups.isEmpty ? null : groups.first.id);
+      _loading = false;
+    });
+    await _refreshQuotes(force: true);
+  }
+
+  Future<void> _persistGroups() async {
+    await widget.storage.saveWatchGroups(_groups);
+    final id = _activeGroupId;
+    if (id != null) await widget.storage.saveActiveWatchGroupId(id);
+  }
+
+  Future<void> _refreshQuotes({bool force = false}) async {
+    if (_items.isEmpty) {
+      setState(() => _quotes = {});
+      return;
+    }
+    setState(() => _refreshing = true);
+    final q = await widget.quotes.fetchQuotes(
+      _items.map((e) => e.ticker).toList(),
+      force: force,
+    );
+    if (!mounted) return;
+    setState(() {
+      _quotes = q;
+      _refreshing = false;
+    });
+  }
+
+  Future<void> _addTicker() async {
+    try {
+      await widget.names.ensureLoaded();
+      final raw = _tickerCtrl.text.trim();
+      final probe = extractTwCode(raw) ?? raw.toUpperCase();
+      if (looksLikeTwCode(probe) &&
+          widget.names.lookup(probe) == null) {
+        await widget.names.refreshFromMarkets();
+      }
+      final ticker = widget.names.normalizeTickerForMarket(raw);
+      if (_items.any((e) => e.ticker == ticker)) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('已在清單中：$ticker')));
+        return;
+      }
+      if (_items.length >= _symbolSoftCap) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('此群組已達建議上限（$_symbolSoftCap 檔）。請刪除部分代號或改用其他群組。'),
+          ),
+        );
+        return;
+      }
+      final name = widget.names.resolveName(ticker);
+      final item = WatchItem(id: newEntityId(), ticker: ticker, name: name);
+      final g = _activeGroup;
+      if (g == null) return;
+      final nextItems = [...g.items, item];
+      final nextGroups = _groups
+          .map((x) => x.id == g.id ? x.copyWith(items: nextItems) : x)
+          .toList();
+      setState(() => _groups = nextGroups);
+      await _persistGroups();
+      _tickerCtrl.clear();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('已加入 ${formatLabel(name, ticker)}')),
+        );
+      }
+      await _refreshQuotes(force: true);
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Future<void> _remove(WatchItem item) async {
+    final g = _activeGroup;
+    if (g == null) return;
+    final nextItems =
+        g.items.where((e) => e.ticker != item.ticker).toList();
+    setState(() {
+      _groups = _groups
+          .map((x) => x.id == g.id ? x.copyWith(items: nextItems) : x)
+          .toList();
+    });
+    await _persistGroups();
+    await _refreshQuotes(force: true);
+  }
+
+  Future<void> _addGroup() async {
+    if (_groups.length >= _groupsSoftCap) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('群組數量已達建議上限（$_groupsSoftCap）'),
+        ),
+      );
+      return;
+    }
+    final nameCtrl = TextEditingController();
+    final noteCtrl = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('新增觀察群組'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: nameCtrl,
+              decoration: const InputDecoration(labelText: '群組名稱'),
+              autofocus: true,
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: noteCtrl,
+              decoration: const InputDecoration(labelText: '備註（選填）'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('建立'),
+          ),
+        ],
+      ),
+    );
+    final name = nameCtrl.text.trim();
+    final note = noteCtrl.text.trim();
+    nameCtrl.dispose();
+    noteCtrl.dispose();
+    if (ok != true || name.isEmpty) return;
+    final g = WatchGroup(
+      id: newEntityId(),
+      name: name,
+      note: note,
+      items: [],
+    );
+    setState(() {
+      _groups = [..._groups, g];
+      _activeGroupId = g.id;
+    });
+    await _persistGroups();
+  }
+
+  Future<void> _editGroupNote() async {
+    final g = _activeGroup;
+    if (g == null) return;
+    final ctrl = TextEditingController(text: g.note);
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('群組備註｜${g.name}'),
+        content: TextField(
+          controller: ctrl,
+          decoration: const InputDecoration(labelText: '備註'),
+          maxLines: 3,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('儲存'),
+          ),
+        ],
+      ),
+    );
+    final note = ctrl.text.trim();
+    ctrl.dispose();
+    if (ok != true) return;
+    setState(() {
+      _groups = _groups
+          .map((x) => x.id == g.id ? x.copyWith(note: note) : x)
+          .toList();
+    });
+    await _persistGroups();
+  }
+
+
+  Future<void> _deleteGroup() async {
+    final g = _activeGroup;
+    if (g == null) return;
+    if (_groups.length <= 1) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('至少需保留一個觀察群組')),
+      );
+      return;
+    }
+    final count = g.items.length;
+    final msg = count == 0
+        ? '確定刪除群組「${g.name}」？'
+        : '群組「${g.name}」尚有 $count 檔代號。\n刪除後會一併移出此群組（不會寫入賣出損益）。確定刪除？';
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('刪除觀察群組'),
+        content: Text(msg),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(ctx).colorScheme.error,
+              foregroundColor: Theme.of(ctx).colorScheme.onError,
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('刪除群組'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final next = _groups.where((x) => x.id != g.id).toList();
+    final newActive = next.first.id;
+    setState(() {
+      _groups = next;
+      _activeGroupId = newActive;
+    });
+    await _persistGroups();
+    await widget.storage.saveActiveWatchGroupId(newActive);
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已刪除群組「${g.name}」')),
+      );
+    }
+    await _refreshQuotes(force: true);
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _tickerCtrl.removeListener(_onTickerInputChanged);
+    _tickerCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    final cs = Theme.of(context).colorScheme;
+    final g = _activeGroup;
+    final visibleGroups = _groups;
+
+    return RefreshIndicator(
+      onRefresh: () => _refreshQuotes(force: true),
+      child: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+        children: [
+          sectionHeader(
+            context,
+            '觀察清單',
+            subtitle:
+                '平日 08:30–14:30 即時報價（約每 10 秒）；其餘時間用證交所／櫃買／興櫃官方收盤。'
+                '支援多群組與群組備註。',
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: InputDecorator(
+                  decoration: const InputDecoration(
+                    labelText: '群組',
+                    isDense: true,
+                    border: OutlineInputBorder(),
+                  ),
+                  child: DropdownButtonHideUnderline(
+                    child: DropdownButton<String>(
+                      isExpanded: true,
+                      value: g?.id,
+                      items: [
+                        for (final x in visibleGroups)
+                          DropdownMenuItem(
+                            value: x.id,
+                            child: Text(
+                              '${x.name}（${x.items.length}）',
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                      ],
+                      onChanged: (id) async {
+                        if (id == null) return;
+                        setState(() => _activeGroupId = id);
+                        await widget.storage.saveActiveWatchGroupId(id);
+                        await _refreshQuotes(force: true);
+                      },
+                    ),
+                  ),
+                ),
+              ),
+              IconButton(
+                tooltip: '新增群組',
+                onPressed: _addGroup,
+                icon: const Icon(Icons.create_new_folder_outlined),
+              ),
+              IconButton(
+                tooltip: '群組備註',
+                onPressed: _editGroupNote,
+                icon: const Icon(Icons.sticky_note_2_outlined),
+              ),
+              IconButton(
+                tooltip: '刪除群組',
+                onPressed: _deleteGroup,
+                icon: const Icon(Icons.folder_delete_outlined),
+              ),
+            ],
+          ),
+          if (g != null && g.note.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 4, bottom: 4),
+              child: Text(
+                g.note,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: cs.onSurfaceVariant,
+                    ),
+              ),
+            ),
+          const SizedBox(height: 8),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _tickerCtrl,
+                  decoration: const InputDecoration(
+                    labelText: '代號或名稱',
+                    hintText: '2330、台積 或 AAPL',
+                  ),
+                  textInputAction: TextInputAction.done,
+                  onSubmitted: (_) => _addTicker(),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: FilledButton(
+                  onPressed: _addTicker,
+                  child: const Text('新增'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          if (_inputMirror.isEmpty)
+            Text(
+              '輸入代號或名稱觀察',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+            )
+          else
+            Material(
+              color: Theme.of(context).colorScheme.secondaryContainer,
+              borderRadius: BorderRadius.circular(10),
+              child: Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.edit_note,
+                      size: 20,
+                      color:
+                          Theme.of(context).colorScheme.onSecondaryContainer,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        '目前輸入：$_inputMirror',
+                        style: TextStyle(
+                          fontWeight: FontWeight.w700,
+                          color: Theme.of(context)
+                              .colorScheme
+                              .onSecondaryContainer,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          const SizedBox(height: 4),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed:
+                  _refreshing ? null : () => _refreshQuotes(force: true),
+              icon: _refreshing
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.refresh),
+              label: const Text('更新報價'),
+            ),
+          ),
+          const Divider(),
+          if (_items.isEmpty)
+            emptyState(
+              context,
+              icon: Icons.visibility_outlined,
+              message: '尚未加入任何股票',
+              hint: '輸入代號後按「新增」即可開始追蹤',
+            )
+          else
+            ..._items.map((item) {
+              final q = _quotes[item.ticker];
+              final name = (q?.shortName.isNotEmpty == true)
+                  ? q!.shortName
+                  : (item.name.isNotEmpty
+                      ? item.name
+                      : widget.names.resolveName(item.ticker));
+              String priceText;
+              Color? priceColor;
+              if (q == null) {
+                priceText = '載入中…';
+              } else if (!q.ok) {
+                priceText = q.error ?? '無法取得報價';
+                priceColor = cs.error;
+              } else {
+                final tag = q.priorClose ? '收盤價' : '即時';
+                priceText = '$tag ${q.currency} ${_money.format(q.price)}';
+              }
+              return Card(
+                child: ListTile(
+                  leading: CircleAvatar(
+                    backgroundColor: cs.secondaryContainer,
+                    foregroundColor: cs.onSecondaryContainer,
+                    child: Text(
+                      item.ticker.length <= 4
+                          ? item.ticker
+                          : item.ticker.substring(0, 4),
+                      style: const TextStyle(
+                          fontSize: 11, fontWeight: FontWeight.w700),
+                    ),
+                  ),
+                  title: Text(
+                    formatLabel(name, item.ticker),
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  subtitle: Text(
+                    priceText,
+                    style: TextStyle(color: priceColor ?? cs.onSurfaceVariant),
+                  ),
+                  trailing: IconButton(
+                    tooltip: '移除',
+                    icon: const Icon(Icons.delete_outline),
+                    onPressed: () => _remove(item),
+                  ),
+                ),
+              );
+            }),
+        ],
+      ),
+    );
+  }
+}

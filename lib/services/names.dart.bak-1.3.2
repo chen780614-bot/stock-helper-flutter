@@ -1,0 +1,272 @@
+import 'dart:convert';
+import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
+import 'storage.dart';
+import 'ticker.dart';
+
+class NamesService {
+  NamesService(this._storage);
+  final AppStorage _storage;
+
+  Map<String, String> _memory = {};
+  /// Codes known to trade on TPEx (櫃買／上櫃), including KY stocks & TPEx ETFs.
+  final Set<String> _otcCodes = {};
+  /// Codes known to trade on 興櫃 (Emerging / ESM). Yahoo suffix is also .TWO.
+  final Set<String> _esmCodes = {};
+  bool _loaded = false;
+
+  Future<void> ensureLoaded() async {
+    if (_loaded) return;
+    final bundled =
+        await rootBundle.loadString('assets/tw_names_subset.json');
+    _memory = Map<String, String>.from(jsonDecode(bundled) as Map);
+    try {
+      final otcBundled =
+          await rootBundle.loadString('assets/tw_otc_codes_subset.json');
+      final list = jsonDecode(otcBundled) as List<dynamic>;
+      for (final e in list) {
+        final s = '$e'.trim();
+        if (s.isNotEmpty) _otcCodes.add(s);
+      }
+    } catch (_) {}
+    try {
+      final esmBundled =
+          await rootBundle.loadString('assets/tw_esm_codes_subset.json');
+      final list = jsonDecode(esmBundled) as List<dynamic>;
+      for (final e in list) {
+        final s = '$e'.trim();
+        if (s.isNotEmpty) _esmCodes.add(s);
+      }
+    } catch (_) {}
+    final cached = await _storage.loadNamesCache();
+    if (cached != null) {
+      _memory.addAll(cached.names);
+      if (cached.otcCodes.isNotEmpty) {
+        _otcCodes
+          ..clear()
+          ..addAll(cached.otcCodes);
+      }
+      if (cached.esmCodes.isNotEmpty) {
+        _esmCodes
+          ..clear()
+          ..addAll(cached.esmCodes);
+      }
+    }
+    _loaded = true;
+  }
+
+  /// Refresh name maps from TWSE (上市) + TPEx (上櫃) + 興櫃 official daily lists.
+  /// Prefer [refreshFromMarkets]; kept as alias for older call sites.
+  Future<void> refreshFromTwse() => refreshFromMarkets();
+
+  Future<void> refreshFromMarkets() async {
+    await ensureLoaded();
+    final map = <String, String>{};
+    final otc = <String>{};
+    final esm = <String>{};
+
+    try {
+      final uri = Uri.parse(
+          'https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL');
+      final resp = await http.get(uri, headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'stock-helper-flutter/1.0',
+      }).timeout(const Duration(seconds: 45));
+      if (resp.statusCode == 200) {
+        final list = jsonDecode(utf8.decode(resp.bodyBytes)) as List<dynamic>;
+        for (final row in list) {
+          if (row is! Map) continue;
+          final code = '${row['Code'] ?? ''}'.trim();
+          final name = '${row['Name'] ?? ''}'.trim();
+          if (code.isNotEmpty && name.isNotEmpty) map[code] = name;
+        }
+      }
+    } catch (_) {
+      // keep bundled / cache
+    }
+
+    try {
+      final uri = Uri.parse(
+          'https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes');
+      final resp = await http.get(uri, headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'stock-helper-flutter/1.0',
+      }).timeout(const Duration(seconds: 60));
+      if (resp.statusCode == 200) {
+        final list = jsonDecode(utf8.decode(resp.bodyBytes)) as List<dynamic>;
+        for (final row in list) {
+          if (row is! Map) continue;
+          final code = '${row['SecuritiesCompanyCode'] ?? ''}'.trim();
+          final name = '${row['CompanyName'] ?? ''}'.trim();
+          if (code.isEmpty || name.isEmpty) continue;
+          map[code] = name;
+          otc.add(code);
+        }
+      }
+    } catch (_) {
+      // keep bundled / cache
+    }
+
+    try {
+      final uri = Uri.parse(
+          'https://www.tpex.org.tw/openapi/v1/tpex_esb_latest_statistics');
+      final resp = await http.get(uri, headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'stock-helper-flutter/1.0',
+      }).timeout(const Duration(seconds: 60));
+      if (resp.statusCode == 200) {
+        final list = jsonDecode(utf8.decode(resp.bodyBytes)) as List<dynamic>;
+        for (final row in list) {
+          if (row is! Map) continue;
+          final code = '${row['SecuritiesCompanyCode'] ?? ''}'.trim();
+          final name = '${row['CompanyName'] ?? ''}'.trim();
+          if (code.isEmpty) continue;
+          // Prefer listed / 上櫃 if a code already graduated.
+          if (map.containsKey(code) || otc.contains(code)) continue;
+          if (name.isNotEmpty) map[code] = name;
+          esm.add(code);
+        }
+      }
+    } catch (_) {
+      // keep bundled / cache
+    }
+
+    if (map.isNotEmpty) {
+      _memory.addAll(map);
+      if (otc.isNotEmpty) {
+        _otcCodes
+          ..clear()
+          ..addAll(otc);
+      }
+      if (esm.isNotEmpty) {
+        _esmCodes
+          ..clear()
+          ..addAll(esm);
+      }
+      await _storage.saveNamesCache(
+        _memory,
+        otcCodes: _otcCodes,
+        esmCodes: _esmCodes,
+      );
+    }
+  }
+
+  bool isOtcCode(String code) => _otcCodes.contains(code);
+
+  bool isEsmCode(String code) => _esmCodes.contains(code);
+
+  bool _isTwoSuffixCode(String code) =>
+      _otcCodes.contains(code) || _esmCodes.contains(code);
+
+  /// Yahoo / internal suffix: .TWO for TPEx 上櫃 and 興櫃, .TW for TWSE (default).
+  String marketSuffixForCode(String code) =>
+      _isTwoSuffixCode(code) ? 'TWO' : 'TW';
+
+  /// Like [normalizeTicker], but bare digit codes use the known market
+  /// (TPEx／興櫃 → .TWO) when the name cache has classified them.
+  String normalizeTickerForMarket(String raw) {
+    final s = raw.trim().toUpperCase();
+    if (s.isEmpty) {
+      throw ArgumentError('股票代號不可為空');
+    }
+    final twSuffix = RegExp(r'^(\d{4,6})\.(TW|TWO)$');
+    final m1 = twSuffix.firstMatch(s);
+    if (m1 != null) {
+      final code = m1.group(1)!;
+      // If user typed .TW but code is OTC/興櫃, correct to .TWO (and vice versa).
+      if (_isTwoSuffixCode(code) && m1.group(2) == 'TW') {
+        return '$code.TWO';
+      }
+      if (!_isTwoSuffixCode(code) &&
+          m1.group(2) == 'TWO' &&
+          _memory.containsKey(code)) {
+        return '$code.TW';
+      }
+      return s;
+    }
+
+    final pureDigits = RegExp(r'^\d{4,6}$');
+    if (pureDigits.hasMatch(s)) {
+      return '$s.${marketSuffixForCode(s)}';
+    }
+
+    final alias = RegExp(r'^(\d{4,6})[\s\-_]+(TW|TWO)$');
+    final m2 = alias.firstMatch(s);
+    if (m2 != null) {
+      final code = m2.group(1)!;
+      return '$code.${marketSuffixForCode(code)}';
+    }
+
+    return normalizeTicker(raw);
+  }
+
+  String? lookup(String ticker) {
+    final code = extractTwCode(ticker);
+    if (code == null) return null;
+    return _memory[code];
+  }
+
+  String resolveName(String ticker, {String? fallback}) {
+    return lookup(ticker) ?? fallback ?? '';
+  }
+
+  /// Resolve bare TW code from a Chinese (or mixed) stock name.
+  /// Exact match first; then unique containment (partial name).
+  String? resolveCodeByName(String rawName) {
+    final name = rawName.trim();
+    if (name.isEmpty) return null;
+
+    String? exact;
+    for (final e in _memory.entries) {
+      if (e.value == name) {
+        if (exact == null || e.key.length < exact.length) exact = e.key;
+      }
+    }
+    if (exact != null) return exact;
+
+    final hits = <MapEntry<String, String>>[];
+    for (final e in _memory.entries) {
+      final v = e.value;
+      if (v.isEmpty) continue;
+      if (name.contains(v) || v.contains(name)) {
+        hits.add(e);
+      }
+    }
+    if (hits.isEmpty) return null;
+    if (hits.length == 1) return hits.first.key;
+
+    hits.sort((a, b) {
+      final byLen = b.value.length.compareTo(a.value.length);
+      if (byLen != 0) return byLen;
+      return a.key.length.compareTo(b.key.length);
+    });
+    if (hits.length >= 2 && hits[0].value.length == hits[1].value.length) {
+      final top = hits[0];
+      final equallySpecific =
+          hits.where((h) => h.value.length == top.value.length).toList();
+      if (equallySpecific.length > 1) {
+        final exactish = equallySpecific
+            .where((h) => name == h.value || name.contains(h.value))
+            .toList();
+        if (exactish.length == 1) return exactish.first.key;
+      }
+    }
+    return hits.first.key;
+  }
+
+  /// For unit tests without Flutter binding when map is injected.
+  void debugReplaceMemory(
+    Map<String, String> map, {
+    Set<String>? otcCodes,
+    Set<String>? esmCodes,
+  }) {
+    _memory = Map<String, String>.from(map);
+    _otcCodes
+      ..clear()
+      ..addAll(otcCodes ?? {});
+    _esmCodes
+      ..clear()
+      ..addAll(esmCodes ?? {});
+    _loaded = true;
+  }
+}
