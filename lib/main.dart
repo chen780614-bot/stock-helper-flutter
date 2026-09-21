@@ -168,6 +168,7 @@ class _HomePageState extends State<HomePage> {
       MaterialPageRoute<void>(
         builder: (_) => SettingsScreen(
           storage: widget.storage,
+          names: _names,
           themeMode: widget.themeMode,
           onThemeModeChanged: widget.onThemeModeChanged,
           adFree: widget.adFree,

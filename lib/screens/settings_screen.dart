@@ -8,6 +8,7 @@ import '../services/ad_free.dart';
 import '../services/billing.dart';
 import '../services/entitlement.dart';
 import '../services/rewarded_ads.dart';
+import '../services/names.dart';
 import '../services/storage.dart';
 import 'backup_screen.dart';
 
@@ -21,6 +22,7 @@ class SettingsScreen extends StatefulWidget {
     required this.adFree,
     required this.entitlement,
     required this.billing,
+    required this.names,
     this.onImported,
   });
 
@@ -30,6 +32,7 @@ class SettingsScreen extends StatefulWidget {
   final AdFreeController adFree;
   final EntitlementService entitlement;
   final BillingService billing;
+  final NamesService names;
   final VoidCallback? onImported;
 
   @override
@@ -38,11 +41,13 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   bool _busy = false;
+  bool _dbBusy = false;
   bool _online = true;
   Timer? _countdown;
   Timer? _netPoll;
   String _versionLabel = '';
   int _versionLongPressTicks = 0;
+  String _dbStatus = '讀取中…';
 
   @override
   void initState() {
@@ -59,6 +64,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _refreshNetwork();
     });
     _loadVersion();
+    _loadDbStatus();
   }
 
   @override
@@ -203,6 +209,71 @@ class _SettingsScreenState extends State<SettingsScreen> {
       await widget.entitlement.debugUnlock();
     } else if (unlock == false) {
       await widget.entitlement.debugLock();
+    }
+  }
+
+
+  Future<void> _loadDbStatus() async {
+    try {
+      await widget.names.ensureLoaded();
+      final meta = await widget.names.readSyncMeta();
+      final active = await widget.names.activeCount();
+      if (!mounted) return;
+      final last = meta.lastSuccessAt.isEmpty
+          ? '尚未更新'
+          : _formatLocal(meta.lastSuccessAt);
+      setState(() {
+        _dbStatus = '約 $active 檔　上次更新：$last';
+        if (meta.lastError.isNotEmpty) {
+          _dbStatus = '$_dbStatus\n上次錯誤：${meta.lastError}';
+        }
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _dbStatus = '無法讀取資料庫：$e');
+    }
+  }
+
+  String _formatLocal(String iso) {
+    try {
+      final t = DateTime.parse(iso).toLocal();
+      String two(int n) => n.toString().padLeft(2, '0');
+      return '${t.year}-${two(t.month)}-${two(t.day)} ${two(t.hour)}:${two(t.minute)}';
+    } catch (_) {
+      return iso;
+    }
+  }
+
+  Future<void> _updateSecuritiesDb() async {
+    if (_dbBusy) return;
+    setState(() => _dbBusy = true);
+    try {
+      final meta = await widget.names.syncNow();
+      if (!mounted) return;
+      final active = await widget.names.activeCount();
+      final last = meta.lastSuccessAt.isEmpty
+          ? '—'
+          : _formatLocal(meta.lastSuccessAt);
+      setState(() {
+        _dbStatus = '約 $active 檔　上次更新：$last';
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            meta.lastError.isEmpty
+                ? '股票資料庫已更新（$active 檔）'
+                : '更新完成但有警告：${meta.lastError}',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('更新失敗：$e')),
+      );
+      await _loadDbStatus();
+    } finally {
+      if (mounted) setState(() => _dbBusy = false);
     }
   }
 
@@ -403,6 +474,30 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ],
           ],
+          const Divider(height: 32),
+          Text('股票資料庫', style: Theme.of(context).textTheme.titleLarge),
+          const SizedBox(height: 4),
+          Text(
+            '官方上市／上櫃／興櫃證券主檔（與報價分開）。首次開啟會自動建立，之後超過 24 小時會背景更新。',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+          const SizedBox(height: 8),
+          Text(
+            _dbStatus,
+            style: Theme.of(context).textTheme.bodyMedium,
+          ),
+          const SizedBox(height: 12),
+          FilledButton.tonalIcon(
+            onPressed: _dbBusy ? null : _updateSecuritiesDb,
+            icon: _dbBusy
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.cloud_download_outlined),
+            label: Text(_dbBusy ? '更新中…' : '更新股票資料庫'),
+          ),
           const Divider(height: 32),
           Text('備份', style: Theme.of(context).textTheme.titleLarge),
           const SizedBox(height: 4),
