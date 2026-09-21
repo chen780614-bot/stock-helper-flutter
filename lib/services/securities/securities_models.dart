@@ -203,3 +203,83 @@ String yahooSymbolFor(String code, TwMarket market) {
   if (suf == null) return '';
   return '$code.$suf';
 }
+
+class MarketSyncMeta {
+  const MarketSyncMeta({
+    required this.market,
+    required this.lastSuccessAt,
+    required this.lastAttemptAt,
+    required this.recordCount,
+    required this.source,
+    required this.errorMessage,
+  });
+
+  final TwMarket market;
+  final String lastSuccessAt;
+  final String lastAttemptAt;
+  final int recordCount;
+  final String source;
+  final String errorMessage;
+
+  bool get succeededLast =>
+      errorMessage.isEmpty && lastSuccessAt.isNotEmpty;
+
+  bool get failedLast => errorMessage.isNotEmpty;
+}
+
+class MarketSyncOutcome {
+  const MarketSyncOutcome({
+    required this.market,
+    required this.success,
+    required this.recordCount,
+    required this.source,
+    required this.errorMessage,
+    required this.skipped,
+  });
+
+  final TwMarket market;
+  final bool success;
+  final int recordCount;
+  final String source;
+  final String errorMessage;
+  final bool skipped;
+
+  String get statusZh {
+    if (skipped) return '略過';
+    if (success) return '成功';
+    return '失敗';
+  }
+}
+
+class OverallSyncResult {
+  const OverallSyncResult({
+    required this.markets,
+    required this.completedAt,
+  });
+
+  final List<MarketSyncOutcome> markets;
+  final String completedAt;
+
+  bool get anySuccess => markets.any((m) => m.success);
+  bool get allSuccess =>
+      markets.isNotEmpty && markets.every((m) => m.success || m.skipped);
+
+  MarketSyncOutcome? forMarket(TwMarket m) {
+    for (final o in markets) {
+      if (o.market == m) return o;
+    }
+    return null;
+  }
+}
+
+/// True when [iso] falls on the same local calendar day as [now].
+bool isSameLocalCalendarDay(String iso, [DateTime? now]) {
+  if (iso.isEmpty) return false;
+  try {
+    final t = DateTime.parse(iso).toLocal();
+    final n = (now ?? DateTime.now()).toLocal();
+    return t.year == n.year && t.month == n.month && t.day == n.day;
+  } catch (_) {
+    return false;
+  }
+}

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'securities/securities_db.dart';
 import 'securities/securities_models.dart';
 import 'securities/securities_sync.dart';
@@ -22,35 +24,33 @@ class NamesService {
   final Set<String> _otcCodes = {};
   final Set<String> _esmCodes = {};
 
+  /// Hydrate from local DB only — never blocks on network.
+  /// Schedules a non-blocking background sync when needed.
   Future<void> ensureLoaded() async {
     if (_loaded) return;
     await _db.database;
     await _hydrateFromDb();
     _loaded = true;
 
-    final meta = await _db.readMeta();
-    final empty = meta.rowCount == 0;
-    final stale = _isStale(meta.lastSuccessAt);
-    if (empty) {
-      // First load: block until we have something (best-effort).
-      try {
-        await refreshFromMarkets(force: true);
-      } catch (_) {}
-    } else if (stale) {
-      // Background refresh if last success > 24h.
-      // ignore: unawaited_futures
-      refreshFromMarkets();
-    }
+    // Non-blocking background update (same calendar day → skip).
+    // ignore: unawaited_futures
+    _maybeBackgroundSync();
   }
 
-  bool _isStale(String lastSuccessAt) {
-    if (lastSuccessAt.isEmpty) return true;
+  Future<void> _maybeBackgroundSync() async {
     try {
-      final t = DateTime.parse(lastSuccessAt);
-      return DateTime.now().difference(t) > const Duration(hours: 24);
-    } catch (_) {
-      return true;
-    }
+      await refreshFromMarkets(force: false);
+    } catch (_) {}
+  }
+
+  /// Auto sync skipped when every market already succeeded today (local TZ).
+  Future<bool> shouldAutoSync() async {
+    final metas = await _db.readAllMarketMeta();
+    final anyData = metas.any((m) => m.recordCount > 0) ||
+        (await _db.countRows(activeOnly: false)) > 0;
+    if (!anyData) return true; // empty DB → try once in background
+    // Skip only when ALL markets succeeded on the same local calendar day.
+    return !metas.every((m) => isSameLocalCalendarDay(m.lastSuccessAt));
   }
 
   Future<void> _hydrateFromDb() async {
@@ -70,7 +70,6 @@ class NamesService {
       final market = '${r['market'] ?? ''}';
       final active = ((r['is_active'] as int?) ?? 1) == 1;
       if (code.isEmpty || name.isEmpty) continue;
-      // Prefer first (active-first) name for code.
       _memory.putIfAbsent(code, () => name);
       if (!active) continue;
       if (market == 'TPEX') _otcCodes.add(code);
@@ -85,12 +84,13 @@ class NamesService {
     if (_refreshing) return;
     _refreshing = true;
     try {
-      await ensureLoaded();
+      if (!_loaded) {
+        await _db.database;
+        await _hydrateFromDb();
+        _loaded = true;
+      }
       if (!force) {
-        final meta = await _db.readMeta();
-        if (meta.rowCount > 0 && !_isStale(meta.lastSuccessAt)) {
-          return;
-        }
+        if (!await shouldAutoSync()) return;
       }
       await _sync.sync(force: force);
       await _hydrateFromDb();
@@ -99,16 +99,26 @@ class NamesService {
     }
   }
 
-  Future<SyncMeta> syncNow() async {
-    await ensureLoaded();
-    final meta = await _sync.sync(force: true);
+  Future<OverallSyncResult> syncNow() async {
+    if (!_loaded) {
+      await _db.database;
+      await _hydrateFromDb();
+      _loaded = true;
+    }
+    final result = await _sync.sync(force: true);
     await _hydrateFromDb();
-    return meta;
+    return result;
   }
 
   Future<SyncMeta> readSyncMeta() => _db.readMeta();
 
+  Future<List<MarketSyncMeta>> readMarketSyncMeta() =>
+      _db.readAllMarketMeta();
+
   Future<int> activeCount() => _db.countRows(activeOnly: true);
+
+  Future<int> countForMarket(TwMarket market) =>
+      _db.countForMarket(market, activeOnly: true);
 
   bool isOtcCode(String code) => _otcCodes.contains(code.trim().toUpperCase());
 
@@ -118,8 +128,6 @@ class NamesService {
       _otcCodes.contains(code) || _esmCodes.contains(code);
 
   /// Yahoo / internal suffix: .TWO for TPEx 上櫃 and 興櫃, .TW for TWSE.
-  /// EMERGING also uses .TWO historically for Yahoo; master stores no guess
-  /// for yahoo_symbol on EMERGING, but ticker suffix still .TWO for quotes.
   String marketSuffixForCode(String code) =>
       _isTwoSuffixCode(code) ? 'TWO' : 'TW';
 
@@ -189,7 +197,6 @@ class NamesService {
     final name = rawName.trim();
     if (name.isEmpty) return null;
 
-    // Sync path uses in-memory map (already filtered warrants).
     String? exact;
     for (final e in _memory.entries) {
       if (e.value == name) {
@@ -199,9 +206,6 @@ class NamesService {
     if (exact != null) return exact;
 
     final norm = normalizeSearchKey(name);
-    // Alias exact via memory scan of common short names already in DB hydrate
-    // is incomplete; do a quick sync search if DB is ready.
-    // Prefer contains ranking on memory for offline UX.
     final hits = <MapEntry<String, String>>[];
     for (final e in _memory.entries) {
       final v = e.value;

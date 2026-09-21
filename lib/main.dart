@@ -131,11 +131,11 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
-    // Cold start: always refresh TWSE+TPEx(+ESM) name/close maps in background
+    // Cold start: hydrate local master; background sync if not same calendar day.
+    // Never blocks UI on network.
     () async {
       try {
         await _names.ensureLoaded();
-        await _names.refreshFromMarkets();
       } catch (_) {}
     }();
 

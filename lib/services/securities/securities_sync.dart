@@ -6,121 +6,193 @@ import 'package:http/http.dart' as http;
 
 import 'securities_db.dart';
 import 'securities_models.dart';
+import 'securities_validator.dart';
 
-/// Syncs official TW securities masters into SQLite.
-/// Quotes APIs are NEVER used as existence authority.
+typedef MarketFetcher = Future<FetchPayload> Function(TwMarket market, String now);
+
+class FetchPayload {
+  const FetchPayload({
+    required this.httpOk,
+    required this.rows,
+    required this.source,
+    this.errorMessage = '',
+  });
+
+  final bool httpOk;
+  final List<Map<String, Object?>> rows;
+  final String source;
+  final String errorMessage;
+}
+
+/// Syncs official TW securities masters into SQLite — per market, staged,
+/// validated, transactional. Quotes APIs are NEVER existence authority.
 class SecuritiesSync {
-  SecuritiesSync(this.db);
-  final SecuritiesDb db;
+  SecuritiesSync(
+    this.db, {
+    http.Client? client,
+    SecuritiesValidator? validator,
+    MarketFetcher? fetcherOverride,
+  })  : _client = client ?? http.Client(),
+        _validator = validator ?? const SecuritiesValidator(),
+        _fetcherOverride = fetcherOverride,
+        _ownsClient = client == null;
+
+  final SecuritiesSyncStore db;
+  final http.Client _client;
+  final SecuritiesValidator _validator;
+  final MarketFetcher? _fetcherOverride;
+  final bool _ownsClient;
 
   static const _ua = 'stock-helper-flutter/1.4';
 
-  Future<SyncMeta> sync({bool force = false}) async {
+  void close() {
+    if (_ownsClient) _client.close();
+  }
+
+  /// Sync each market independently. One failure does not undo others.
+  Future<OverallSyncResult> sync({bool force = false}) async {
     final now = DateTime.now().toIso8601String();
-    await db.writeMeta(lastAttemptAt: now);
+    final outcomes = <MarketSyncOutcome>[];
+    for (final market in TwMarket.values) {
+      outcomes.add(await syncMarket(market, force: force, nowIso: now));
+    }
+    await db.ensureBuiltinAliases();
+    await db.refreshAggregateMeta();
+    return OverallSyncResult(markets: outcomes, completedAt: now);
+  }
+
+  Future<MarketSyncOutcome> syncMarket(
+    TwMarket market, {
+    bool force = false,
+    String? nowIso,
+  }) async {
+    final now = nowIso ?? DateTime.now().toIso8601String();
+    await db.writeMarketMeta(market, lastAttemptAt: now);
+
     try {
-      final rows = <Map<String, Object?>>[];
-      final keys = <String>{};
-      final sources = <String>[];
+      final payload = _fetcherOverride != null
+          ? await _fetcherOverride(market, now)
+          : await _fetchMarket(market, now);
 
-      final twse = await _fetchTwseCompanies(now);
-      if (twse.isNotEmpty) {
-        rows.addAll(twse);
-        sources.add('TWSE:t187ap03_L');
-      }
-
-      final tpex = await _fetchTpexCompanies(now);
-      if (tpex.isNotEmpty) {
-        rows.addAll(tpex);
-        sources.add('TPEX:mopsfin_t187ap03_O');
-      }
-
-      final isin = await _fetchIsinAll(now);
-      if (isin.isNotEmpty) {
-        final byKey = {
-          for (final r in rows) '${r['code']}|${r['market']}': r
-        };
-        for (final r in isin) {
-          final k = '${r['code']}|${r['market']}';
-          final prev = byKey[k];
-          if (prev == null) {
-            byKey[k] = r;
-          } else {
-            final t = '${r['security_type']}';
-            if (t != 'STOCK' && t != 'OTHER') {
-              byKey[k] = {
-                ...prev,
-                ...r,
-                'name': (prev['name'] != null && '${prev['name']}'.isNotEmpty)
-                    ? prev['name']
-                    : r['name'],
-              };
-            } else {
-              byKey[k] = {
-                ...prev,
-                'isin': (prev['isin'] == null || '${prev['isin']}'.isEmpty)
-                    ? r['isin']
-                    : prev['isin'],
-                'industry': (prev['industry'] == null ||
-                        '${prev['industry']}'.isEmpty)
-                    ? r['industry']
-                    : prev['industry'],
-                'listing_date': (prev['listing_date'] == null ||
-                        '${prev['listing_date']}'.isEmpty)
-                    ? r['listing_date']
-                    : prev['listing_date'],
-              };
-            }
-          }
-        }
-        rows
-          ..clear()
-          ..addAll(byKey.values);
-        sources.add('ISIN:C_public');
-      }
-
-      if (rows.isEmpty) {
-        await db.writeMeta(
+      if (!payload.httpOk) {
+        final msg = payload.errorMessage.isNotEmpty
+            ? payload.errorMessage
+            : 'HTTP 失敗，已保留舊資料';
+        await db.writeMarketMeta(
+          market,
           lastAttemptAt: now,
-          lastError: '所有官方來源皆失敗，已保留舊資料',
+          errorMessage: msg,
         );
-        return await db.readMeta();
+        final meta = await db.readMarketMeta(market);
+        return MarketSyncOutcome(
+          market: market,
+          success: false,
+          recordCount: meta.recordCount,
+          source: meta.source,
+          errorMessage: msg,
+          skipped: false,
+        );
       }
 
-      for (final r in rows) {
-        keys.add('${r['code']}|${r['market']}');
-      }
+      final prior = await db.readMarketMeta(market);
+      final lastCount = prior.recordCount > 0
+          ? prior.recordCount
+          : await db.countForMarket(market, activeOnly: true);
 
-      await db.upsertBatch(rows);
-      await db.markAbsentInactive(keys, now);
-      await db.ensureBuiltinAliases();
-      final count = await db.countRows();
-      await db.writeMeta(
-        lastSuccessAt: now,
-        lastAttemptAt: now,
-        rowCount: count,
-        source: sources.join('+'),
-        lastError: '',
+      final staged = List<Map<String, Object?>>.from(payload.rows);
+      final validated = _validator.validate(
+        market: market,
+        httpOk: true,
+        staged: staged,
+        lastSuccessfulCount: lastCount,
       );
-      return await db.readMeta();
+
+      if (!validated.ok) {
+        await db.writeMarketMeta(
+          market,
+          lastAttemptAt: now,
+          errorMessage: validated.errorMessage,
+          // Do NOT touch record_count / last_success_at / is_active.
+        );
+        return MarketSyncOutcome(
+          market: market,
+          success: false,
+          recordCount: prior.recordCount,
+          source: prior.source,
+          errorMessage: validated.errorMessage,
+          skipped: false,
+        );
+      }
+
+      await db.commitMarketUpdate(
+        market: market,
+        rows: validated.rows,
+        nowIso: now,
+        source: payload.source,
+      );
+
+      final after = await db.readMarketMeta(market);
+      return MarketSyncOutcome(
+        market: market,
+        success: true,
+        recordCount: after.recordCount,
+        source: after.source,
+        errorMessage: '',
+        skipped: false,
+      );
     } catch (e) {
-      await db.writeMeta(
+      final msg = e.toString();
+      await db.writeMarketMeta(
+        market,
         lastAttemptAt: now,
-        lastError: e.toString(),
+        errorMessage: msg,
       );
-      rethrow;
+      final meta = await db.readMarketMeta(market);
+      return MarketSyncOutcome(
+        market: market,
+        success: false,
+        recordCount: meta.recordCount,
+        source: meta.source,
+        errorMessage: msg,
+        skipped: false,
+      );
     }
   }
 
-  Future<List<Map<String, Object?>>> _fetchTwseCompanies(String now) async {
+  Future<FetchPayload> _fetchMarket(TwMarket market, String now) async {
+    switch (market) {
+      case TwMarket.twse:
+        return _fetchTwse(now);
+      case TwMarket.tpex:
+        return _fetchTpex(now);
+      case TwMarket.emerging:
+        return _fetchEmerging(now);
+    }
+  }
+
+  Future<FetchPayload> _fetchTwse(String now) async {
     final uri =
         Uri.parse('https://openapi.twse.com.tw/v1/opendata/t187ap03_L');
-    final resp = await http
+    final resp = await _client
         .get(uri, headers: {'Accept': 'application/json', 'User-Agent': _ua})
         .timeout(const Duration(seconds: 60));
-    if (resp.statusCode != 200) return const [];
+    if (resp.statusCode != 200) {
+      return FetchPayload(
+        httpOk: false,
+        rows: const [],
+        source: 'TWSE:t187ap03_L',
+        errorMessage: 'HTTP ${resp.statusCode}',
+      );
+    }
     final list = jsonDecode(utf8.decode(resp.bodyBytes));
-    if (list is! List) return const [];
+    if (list is! List) {
+      return const FetchPayload(
+        httpOk: true,
+        rows: [],
+        source: 'TWSE:t187ap03_L',
+        errorMessage: 'JSON 非陣列',
+      );
+    }
     final out = <Map<String, Object?>>[];
     for (final row in list) {
       if (row is! Map) continue;
@@ -139,18 +211,32 @@ class SecuritiesSync {
         now: now,
       ));
     }
-    return out;
+    return FetchPayload(httpOk: true, rows: out, source: 'TWSE:t187ap03_L');
   }
 
-  Future<List<Map<String, Object?>>> _fetchTpexCompanies(String now) async {
+  Future<FetchPayload> _fetchTpex(String now) async {
     final uri = Uri.parse(
         'https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O');
-    final resp = await http
+    final resp = await _client
         .get(uri, headers: {'Accept': 'application/json', 'User-Agent': _ua})
         .timeout(const Duration(seconds: 60));
-    if (resp.statusCode != 200) return const [];
+    if (resp.statusCode != 200) {
+      return FetchPayload(
+        httpOk: false,
+        rows: const [],
+        source: 'TPEX:mopsfin_t187ap03_O',
+        errorMessage: 'HTTP ${resp.statusCode}',
+      );
+    }
     final list = jsonDecode(utf8.decode(resp.bodyBytes));
-    if (list is! List) return const [];
+    if (list is! List) {
+      return const FetchPayload(
+        httpOk: true,
+        rows: [],
+        source: 'TPEX:mopsfin_t187ap03_O',
+        errorMessage: 'JSON 非陣列',
+      );
+    }
     final out = <Map<String, Object?>>[];
     for (final row in list) {
       if (row is! Map) continue;
@@ -174,22 +260,29 @@ class SecuritiesSync {
         now: now,
       ));
     }
-    return out;
+    return FetchPayload(
+      httpOk: true,
+      rows: out,
+      source: 'TPEX:mopsfin_t187ap03_O',
+    );
   }
 
-  /// ISIN public tables: mode 2 TWSE, 4 TPEx, 5 Emerging.
-  Future<List<Map<String, Object?>>> _fetchIsinAll(String now) async {
-    final out = <Map<String, Object?>>[];
-    for (final mode in <(int, TwMarket)>[
-      (2, TwMarket.twse),
-      (4, TwMarket.tpex),
-      (5, TwMarket.emerging),
-    ]) {
-      try {
-        out.addAll(await _fetchIsinMode(mode.$1, mode.$2, now));
-      } catch (_) {}
+  Future<FetchPayload> _fetchEmerging(String now) async {
+    try {
+      final rows = await _fetchIsinMode(5, TwMarket.emerging, now);
+      return FetchPayload(
+        httpOk: true,
+        rows: rows,
+        source: 'ISIN:mode5',
+      );
+    } catch (e) {
+      return FetchPayload(
+        httpOk: false,
+        rows: const [],
+        source: 'ISIN:mode5',
+        errorMessage: e.toString(),
+      );
     }
-    return out;
   }
 
   Future<List<Map<String, Object?>>> _fetchIsinMode(
@@ -199,10 +292,12 @@ class SecuritiesSync {
   ) async {
     final uri = Uri.parse(
         'https://isin.twse.com.tw/isin/C_public.jsp?strMode=$mode');
-    final resp = await http
+    final resp = await _client
         .get(uri, headers: {'User-Agent': _ua, 'Accept': 'text/html'})
         .timeout(const Duration(seconds: 90));
-    if (resp.statusCode != 200) return const [];
+    if (resp.statusCode != 200) {
+      throw StateError('HTTP ${resp.statusCode}');
+    }
     final decoded = await _decodeBig5(resp.bodyBytes);
     final re = RegExp(
       r'>(\d{4,6}[A-Z]{0,2})\u3000([^<]+)</td>\s*<td[^>]*>([^<]*)</td>\s*<td[^>]*>([^<]*)</td>\s*<td[^>]*>([^<]*)</td>\s*<td[^>]*>([^<]*)</td>',
@@ -265,7 +360,7 @@ class SecuritiesSync {
   }
 
   bool _looksLikeCode(String code) =>
-      RegExp(r'^\d{4,6}[A-Z]{0,2}$').hasMatch(code);
+      SecuritiesValidator.codePattern.hasMatch(code);
 
   SecurityType _inferType(String code, String name, String industry) {
     final blob = '$name $industry';

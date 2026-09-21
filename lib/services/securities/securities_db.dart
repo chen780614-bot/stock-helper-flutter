@@ -4,10 +4,39 @@ import 'package:sqflite/sqflite.dart';
 
 import 'securities_models.dart';
 
-class SecuritiesDb {
+
+/// Minimal store surface used by [SecuritiesSync] (real SQLite or in-memory fake).
+abstract class SecuritiesSyncStore {
+  Future<MarketSyncMeta> readMarketMeta(TwMarket market);
+  Future<void> writeMarketMeta(
+    TwMarket market, {
+    String? lastSuccessAt,
+    String? lastAttemptAt,
+    int? recordCount,
+    String? source,
+    String? errorMessage,
+  });
+  Future<int> countForMarket(TwMarket market, {bool activeOnly = true});
+  Future<void> commitMarketUpdate({
+    required TwMarket market,
+    required List<Map<String, Object?>> rows,
+    required String nowIso,
+    required String source,
+  });
+  Future<void> ensureBuiltinAliases();
+  Future<void> refreshAggregateMeta();
+}
+
+class SecuritiesDb implements SecuritiesSyncStore {
   SecuritiesDb._();
   static final SecuritiesDb instance = SecuritiesDb._();
+
+  /// Test seam: inject an already-opened DB (e.g. in-memory).
+  SecuritiesDb.forTest(this._db);
+
   Database? _db;
+
+  static const schemaVersion = 2;
 
   Future<Database> get database async {
     final existing = _db;
@@ -22,12 +51,24 @@ class SecuritiesDb {
     final path = p.join(dir.path, 'tw_securities_master.db');
     return openDatabase(
       path,
-      version: 1,
+      version: schemaVersion,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
       onCreate: (db, version) async {
-        await db.execute('''
+        await _createV1(db);
+        await _upgradeToV2(db);
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await _upgradeToV2(db);
+        }
+      },
+    );
+  }
+
+  Future<void> _createV1(Database db) async {
+    await db.execute('''
 CREATE TABLE securities (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   code TEXT NOT NULL,
@@ -48,14 +89,16 @@ CREATE TABLE securities (
   normalized_name TEXT NOT NULL DEFAULT '',
   UNIQUE(code, market)
 )''');
-        await db.execute('CREATE INDEX idx_sec_code ON securities(code)');
-        await db.execute('CREATE INDEX idx_sec_name ON securities(name)');
-        await db.execute('CREATE INDEX idx_sec_full ON securities(full_name)');
-        await db.execute(
-            'CREATE INDEX idx_sec_norm ON securities(normalized_name)');
-        await db.execute(
-            'CREATE INDEX idx_sec_active_type ON securities(is_active, security_type)');
-        await db.execute('''
+    await db.execute('CREATE INDEX idx_sec_code ON securities(code)');
+    await db.execute('CREATE INDEX idx_sec_name ON securities(name)');
+    await db.execute('CREATE INDEX idx_sec_full ON securities(full_name)');
+    await db.execute(
+        'CREATE INDEX idx_sec_norm ON securities(normalized_name)');
+    await db.execute(
+        'CREATE INDEX idx_sec_active_type ON securities(is_active, security_type)');
+    await db.execute(
+        'CREATE INDEX idx_sec_market ON securities(market, is_active)');
+    await db.execute('''
 CREATE TABLE security_aliases (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   security_id INTEGER NOT NULL,
@@ -65,9 +108,9 @@ CREATE TABLE security_aliases (
   source TEXT NOT NULL DEFAULT 'builtin',
   FOREIGN KEY(security_id) REFERENCES securities(id) ON DELETE CASCADE
 )''');
-        await db.execute(
-            'CREATE INDEX idx_alias_norm ON security_aliases(normalized_alias)');
-        await db.execute('''
+    await db.execute(
+        'CREATE INDEX idx_alias_norm ON security_aliases(normalized_alias)');
+    await db.execute('''
 CREATE TABLE sync_meta (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   last_success_at TEXT NOT NULL DEFAULT '',
@@ -76,16 +119,41 @@ CREATE TABLE sync_meta (
   source TEXT NOT NULL DEFAULT '',
   last_error TEXT NOT NULL DEFAULT ''
 )''');
-        await db.insert('sync_meta', {
-          'id': 1,
+    await db.insert('sync_meta', {
+      'id': 1,
+      'last_success_at': '',
+      'last_attempt_at': '',
+      'row_count': 0,
+      'source': '',
+      'last_error': '',
+    });
+  }
+
+  Future<void> _upgradeToV2(DatabaseExecutor db) async {
+    await db.execute('''
+CREATE TABLE IF NOT EXISTS market_sync_meta (
+  market TEXT PRIMARY KEY,
+  last_success_at TEXT NOT NULL DEFAULT '',
+  last_attempt_at TEXT NOT NULL DEFAULT '',
+  record_count INTEGER NOT NULL DEFAULT 0,
+  source TEXT NOT NULL DEFAULT '',
+  error_message TEXT NOT NULL DEFAULT ''
+)''');
+    for (final m in TwMarket.values) {
+      await db.insert(
+        'market_sync_meta',
+        {
+          'market': m.code,
           'last_success_at': '',
           'last_attempt_at': '',
-          'row_count': 0,
+          'record_count': 0,
           'source': '',
-          'last_error': '',
-        });
-      },
-    );
+          'error_message': '',
+        },
+        conflictAlgorithm: ConflictAlgorithm.ignore,
+      );
+    }
+    // Additive only — never deleteDatabase / wipe user tables.
   }
 
   Future<SyncMeta> readMeta() async {
@@ -132,6 +200,69 @@ CREATE TABLE sync_meta (
     );
   }
 
+  @override
+  Future<MarketSyncMeta> readMarketMeta(TwMarket market) async {
+    final db = await database;
+    final rows = await db.query(
+      'market_sync_meta',
+      where: 'market = ?',
+      whereArgs: [market.code],
+      limit: 1,
+    );
+    if (rows.isEmpty) {
+      return MarketSyncMeta(
+        market: market,
+        lastSuccessAt: '',
+        lastAttemptAt: '',
+        recordCount: 0,
+        source: '',
+        errorMessage: '',
+      );
+    }
+    final r = rows.first;
+    return MarketSyncMeta(
+      market: market,
+      lastSuccessAt: '${r['last_success_at'] ?? ''}',
+      lastAttemptAt: '${r['last_attempt_at'] ?? ''}',
+      recordCount: (r['record_count'] as int?) ?? 0,
+      source: '${r['source'] ?? ''}',
+      errorMessage: '${r['error_message'] ?? ''}',
+    );
+  }
+
+  Future<List<MarketSyncMeta>> readAllMarketMeta() async {
+    final out = <MarketSyncMeta>[];
+    for (final m in TwMarket.values) {
+      out.add(await readMarketMeta(m));
+    }
+    return out;
+  }
+
+  @override
+  Future<void> writeMarketMeta(
+    TwMarket market, {
+    String? lastSuccessAt,
+    String? lastAttemptAt,
+    int? recordCount,
+    String? source,
+    String? errorMessage,
+  }) async {
+    final db = await database;
+    final cur = await readMarketMeta(market);
+    await db.insert(
+      'market_sync_meta',
+      {
+        'market': market.code,
+        'last_success_at': lastSuccessAt ?? cur.lastSuccessAt,
+        'last_attempt_at': lastAttemptAt ?? cur.lastAttemptAt,
+        'record_count': recordCount ?? cur.recordCount,
+        'source': source ?? cur.source,
+        'error_message': errorMessage ?? cur.errorMessage,
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
   Future<int> countRows({bool activeOnly = false}) async {
     final db = await database;
     final sql = activeOnly
@@ -141,37 +272,116 @@ CREATE TABLE sync_meta (
     return (r.first['c'] as int?) ?? 0;
   }
 
+  @override
+  Future<int> countForMarket(TwMarket market, {bool activeOnly = true}) async {
+    final db = await database;
+    final sql = activeOnly
+        ? "SELECT COUNT(*) AS c FROM securities WHERE market = ? AND is_active = 1 AND security_type != 'WARRANT'"
+        : 'SELECT COUNT(*) AS c FROM securities WHERE market = ?';
+    final r = await db.rawQuery(sql, [market.code]);
+    return (r.first['c'] as int?) ?? 0;
+  }
+
   /// Upsert by UNIQUE(code, market). Preserves row id (no wipe / no REPLACE).
   Future<void> upsertBatch(List<Map<String, Object?>> rows) async {
     if (rows.isEmpty) return;
     final db = await database;
     await db.transaction((txn) async {
-      for (final row in rows) {
-        final code = '${row['code']}';
-        final market = '${row['market']}';
-        final existing = await txn.query(
-          'securities',
-          columns: ['id'],
-          where: 'code = ? AND market = ?',
-          whereArgs: [code, market],
-          limit: 1,
-        );
-        if (existing.isEmpty) {
-          await txn.insert('securities', row);
-        } else {
-          final id = existing.first['id'];
-          final update = Map<String, Object?>.from(row)..remove('id');
-          await txn.update(
-            'securities',
-            update,
-            where: 'id = ?',
-            whereArgs: [id],
-          );
-        }
-      }
+      await _upsertInTxn(txn, rows);
     });
   }
 
+  Future<void> _upsertInTxn(
+    Transaction txn,
+    List<Map<String, Object?>> rows,
+  ) async {
+    for (final row in rows) {
+      final code = '${row['code']}';
+      final market = '${row['market']}';
+      final existing = await txn.query(
+        'securities',
+        columns: ['id'],
+        where: 'code = ? AND market = ?',
+        whereArgs: [code, market],
+        limit: 1,
+      );
+      if (existing.isEmpty) {
+        await txn.insert('securities', row);
+      } else {
+        final id = existing.first['id'];
+        final update = Map<String, Object?>.from(row)..remove('id');
+        await txn.update(
+          'securities',
+          update,
+          where: 'id = ?',
+          whereArgs: [id],
+        );
+      }
+    }
+  }
+
+  /// Commit one market after validation: upsert + deactivate vanished codes
+  /// for THAT market only. Never DELETE rows. Rollback on failure.
+  @override
+  Future<void> commitMarketUpdate({
+    required TwMarket market,
+    required List<Map<String, Object?>> rows,
+    required String nowIso,
+    required String source,
+  }) async {
+    final db = await database;
+    final presentCodes = <String>{
+      for (final r in rows) '${r['code']}'.toUpperCase(),
+    };
+    await db.transaction((txn) async {
+      await _upsertInTxn(txn, rows);
+
+      final existing = await txn.query(
+        'securities',
+        columns: ['id', 'code', 'is_active'],
+        where: 'market = ?',
+        whereArgs: [market.code],
+      );
+      for (final r in existing) {
+        final code = '${r['code']}'.toUpperCase();
+        final active = (r['is_active'] as int?) ?? 0;
+        if (!presentCodes.contains(code) && active == 1) {
+          await txn.update(
+            'securities',
+            {
+              'is_active': 0,
+              'delisting_date':
+                  nowIso.length >= 10 ? nowIso.substring(0, 10) : nowIso,
+              'last_updated': nowIso,
+            },
+            where: 'id = ?',
+            whereArgs: [r['id']],
+          );
+        }
+      }
+
+      final countRow = await txn.rawQuery(
+        "SELECT COUNT(*) AS c FROM securities WHERE market = ? AND is_active = 1 AND security_type != 'WARRANT'",
+        [market.code],
+      );
+      final count = (countRow.first['c'] as int?) ?? rows.length;
+
+      await txn.insert(
+        'market_sync_meta',
+        {
+          'market': market.code,
+          'last_success_at': nowIso,
+          'last_attempt_at': nowIso,
+          'record_count': count,
+          'source': source,
+          'error_message': '',
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    });
+  }
+
+  @Deprecated('Use commitMarketUpdate — global markAbsent is unsafe across markets')
   Future<void> markAbsentInactive(
       Set<String> presentKeys, String nowIso) async {
     final db = await database;
@@ -326,6 +536,7 @@ LIMIT ?
     return mapRow(rows.first);
   }
 
+  @override
   Future<void> ensureBuiltinAliases() async {
     final db = await database;
     const seeds = <List<String>>[
@@ -366,5 +577,37 @@ LIMIT ?
         'source': 'builtin',
       });
     }
+  }
+
+  /// Refresh aggregate sync_meta from per-market rows (UI backward compat).
+  @override
+  Future<void> refreshAggregateMeta() async {
+    final markets = await readAllMarketMeta();
+    var latestSuccess = '';
+    var latestAttempt = '';
+    final sources = <String>[];
+    final errors = <String>[];
+    var total = 0;
+    for (final m in markets) {
+      total += m.recordCount;
+      if (m.source.isNotEmpty) sources.add('${m.market.code}:${m.source}');
+      if (m.errorMessage.isNotEmpty) {
+        errors.add('${m.market.labelZh}:${m.errorMessage}');
+      }
+      if (m.lastSuccessAt.compareTo(latestSuccess) > 0) {
+        latestSuccess = m.lastSuccessAt;
+      }
+      if (m.lastAttemptAt.compareTo(latestAttempt) > 0) {
+        latestAttempt = m.lastAttemptAt;
+      }
+    }
+    final live = await countRows(activeOnly: true);
+    await writeMeta(
+      lastSuccessAt: latestSuccess,
+      lastAttemptAt: latestAttempt,
+      rowCount: live > 0 ? live : total,
+      source: sources.join('+'),
+      lastError: errors.join('；'),
+    );
   }
 }

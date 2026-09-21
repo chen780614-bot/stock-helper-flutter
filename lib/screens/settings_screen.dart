@@ -9,6 +9,7 @@ import '../services/billing.dart';
 import '../services/entitlement.dart';
 import '../services/rewarded_ads.dart';
 import '../services/names.dart';
+import '../services/securities/securities_models.dart';
 import '../services/storage.dart';
 import 'backup_screen.dart';
 
@@ -216,22 +217,37 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _loadDbStatus() async {
     try {
       await widget.names.ensureLoaded();
-      final meta = await widget.names.readSyncMeta();
+      final markets = await widget.names.readMarketSyncMeta();
       final active = await widget.names.activeCount();
       if (!mounted) return;
-      final last = meta.lastSuccessAt.isEmpty
-          ? '尚未更新'
-          : _formatLocal(meta.lastSuccessAt);
       setState(() {
-        _dbStatus = '約 $active 檔　上次更新：$last';
-        if (meta.lastError.isNotEmpty) {
-          _dbStatus = '$_dbStatus\n上次錯誤：${meta.lastError}';
-        }
+        _dbStatus = _formatMarketStatus(markets, active);
       });
     } catch (e) {
       if (!mounted) return;
       setState(() => _dbStatus = '無法讀取資料庫：$e');
     }
+  }
+
+  String _formatMarketStatus(List<MarketSyncMeta> markets, int activeTotal) {
+    final lines = <String>[];
+    var latest = '';
+    for (final m in markets) {
+      final last =
+          m.lastSuccessAt.isEmpty ? '尚未成功' : _formatLocal(m.lastSuccessAt);
+      final status = m.errorMessage.isEmpty
+          ? (m.lastSuccessAt.isEmpty ? '—' : '成功')
+          : '失敗';
+      final err = m.errorMessage.isEmpty ? '' : '（${m.errorMessage}）';
+      lines.add(
+        '${m.market.labelZh}：${m.recordCount} 檔　$status　上次：$last$err',
+      );
+      if (m.lastSuccessAt.compareTo(latest) > 0) latest = m.lastSuccessAt;
+    }
+    final head = latest.isEmpty
+        ? '合計約 $activeTotal 檔　尚未更新'
+        : '合計約 $activeTotal 檔　最近成功：${_formatLocal(latest)}';
+    return ([head, ...lines]).join('\n');
   }
 
   String _formatLocal(String iso) {
@@ -248,21 +264,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (_dbBusy) return;
     setState(() => _dbBusy = true);
     try {
-      final meta = await widget.names.syncNow();
+      final result = await widget.names.syncNow();
       if (!mounted) return;
+      final markets = await widget.names.readMarketSyncMeta();
       final active = await widget.names.activeCount();
-      final last = meta.lastSuccessAt.isEmpty
-          ? '—'
-          : _formatLocal(meta.lastSuccessAt);
       setState(() {
-        _dbStatus = '約 $active 檔　上次更新：$last';
+        _dbStatus = _formatMarketStatus(markets, active);
       });
+      final ok = result.markets.where((m) => m.success).length;
+      final fail = result.markets.where((m) => !m.success && !m.skipped).length;
+      final detail = result.markets
+          .map((m) => '${m.market.labelZh}${m.statusZh}')
+          .join('、');
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            meta.lastError.isEmpty
-                ? '股票資料庫已更新（$active 檔）'
-                : '更新完成但有警告：${meta.lastError}',
+            fail == 0
+                ? '股票資料庫已更新（$ok 市場成功，$active 檔）'
+                : '部分更新：$detail',
           ),
         ),
       );
@@ -478,7 +497,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           Text('股票資料庫', style: Theme.of(context).textTheme.titleLarge),
           const SizedBox(height: 4),
           Text(
-            '官方上市／上櫃／興櫃證券主檔（與報價分開）。首次開啟會自動建立，之後超過 24 小時會背景更新。',
+            '官方上市／上櫃／興櫃證券主檔（與報價分開）。各市場獨立驗證後才寫入；失敗不會清掉舊資料。同一天內自動略過，可手動強制更新。',
             style: Theme.of(context).textTheme.bodySmall,
           ),
           const SizedBox(height: 8),
