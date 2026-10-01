@@ -48,7 +48,10 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
   int _previewSeq = 0;
   final _priceCtrl = TextEditingController();
   final _sharesCtrl = TextEditingController();
+  final _investedCtrl = TextEditingController();
   final _money = NumberFormat('#,##0.##');
+  /// Per-share actual cost: up to 4 decimals, trailing zeros trimmed.
+  final _unit = NumberFormat('#,##0.####');
   final _pct = NumberFormat('+0.00%;-0.00%');
   Timer? _timer;
 
@@ -203,16 +206,26 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
       final ticker = widget.names.normalizeTickerForMarket(raw);
       final buy = double.tryParse(_priceCtrl.text.trim());
       final shares = double.tryParse(_sharesCtrl.text.trim());
-      if (buy == null || buy <= 0) throw ArgumentError('請輸入有效買入價');
+      final investedText = _investedCtrl.text.trim();
+      final invested =
+          investedText.isEmpty ? null : double.tryParse(investedText);
       if (shares == null || shares <= 0) throw ArgumentError('請輸入有效股數');
+      if (investedText.isNotEmpty) {
+        if (invested == null || invested <= 0) {
+          throw ArgumentError('請輸入有效的實際投入金額（需大於 0），或清空改用買入價');
+        }
+      } else if (buy == null || buy <= 0) {
+        throw ArgumentError('請輸入有效買入價，或填寫實際投入金額');
+      }
       final name = widget.names.resolveName(ticker);
       final existed = g.items.any((e) => e.ticker == ticker);
-      final purchase = Holding(
+      final purchase = buildPurchaseLot(
         id: newEntityId(),
         ticker: ticker,
         name: name,
-        buyPrice: buy,
         shares: shares,
+        buyPrice: buy,
+        invested: invested,
       );
       final nextItems = addOrMergeHolding(g.items, purchase);
       setState(() {
@@ -224,13 +237,14 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
       _tickerCtrl.clear();
       _priceCtrl.clear();
       _sharesCtrl.clear();
+      _investedCtrl.clear();
       final merged = nextItems.firstWhere((e) => e.ticker == ticker);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
               existed
-                  ? '已合併 ${formatLabel(merged.name, ticker)}｜均價 ${_money.format(merged.buyPrice)} × ${_money.format(merged.shares)}'
+                  ? '已合併 ${formatLabel(merged.name, ticker)}｜每股實際成本 ${_unit.format(merged.costPerShare)} × ${_money.format(merged.shares)} 股｜實際投入 ${_money.format(merged.cost)}'
                   : '已登錄 ${formatLabel(name, ticker)}',
             ),
           ),
@@ -240,6 +254,32 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
     }
+  }
+
+  /// Live preview for the add form; null when nothing useful to show.
+  String? _costPreviewText() {
+    final shares = double.tryParse(_sharesCtrl.text.trim());
+    final buy = double.tryParse(_priceCtrl.text.trim());
+    final investedText = _investedCtrl.text.trim();
+    if (investedText.isNotEmpty) {
+      final invested = double.tryParse(investedText);
+      if (invested == null || invested <= 0) {
+        return '實際投入金額需為大於 0 的數字';
+      }
+      if (shares == null || shares <= 0) {
+        return '請輸入股數以計算每股實際成本';
+      }
+      final unit = costPerShareFromInvested(invested, shares);
+      final both = buy != null && buy > 0;
+      return '每股實際成本： ${_unit.format(unit)}'
+          '（${_money.format(invested)} ÷ ${_money.format(shares)}）'
+          '${both ? '\n已同時填寫買入價，將以「實際投入金額」為準' : ''}';
+    }
+    if (buy != null && buy > 0 && shares != null && shares > 0) {
+      return '每股成本： ${_unit.format(buy)}｜實際投入： ${_money.format(buy * shares)}'
+          '（買入價 × 股數；可填實際投入金額以含手續費）';
+    }
+    return null;
   }
 
   Future<void> _remove(Holding h) async {
@@ -567,6 +607,7 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
     _previewLookupPending.dispose();
     _priceCtrl.dispose();
     _sharesCtrl.dispose();
+    _investedCtrl.dispose();
     super.dispose();
   }
 
@@ -731,6 +772,47 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
               ),
             ],
           ),
+          const SizedBox(height: 8),
+          TextField(
+            key: const ValueKey('holdings_invested_field'),
+            controller: _investedCtrl,
+            keyboardType:
+                const TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(
+              labelText: '實際投入金額（含手續費）（選填）',
+              helperText: '填寫後以「投入金額 ÷ 股數」計算每股實際成本',
+            ),
+          ),
+          AnimatedBuilder(
+            animation:
+                Listenable.merge([_priceCtrl, _sharesCtrl, _investedCtrl]),
+            builder: (context, _) {
+              final msg = _costPreviewText();
+              if (msg == null) return const SizedBox.shrink();
+              return Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Material(
+                  color: Theme.of(context).colorScheme.secondaryContainer,
+                  borderRadius: BorderRadius.circular(10),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 10,
+                    ),
+                    child: Text(
+                      msg,
+                      style: TextStyle(
+                        fontWeight: FontWeight.w600,
+                        color: Theme.of(context)
+                            .colorScheme
+                            .onSecondaryContainer,
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
           const SizedBox(height: 10),
           FilledButton(onPressed: _add, child: const Text('新增／合併持倉')),
           const SizedBox(height: 8),
@@ -747,7 +829,7 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
             summaryCard(
               context,
               children: [
-                Text('總成本：${_money.format(totalCost)}',
+                Text('實際投入總額（總成本）：${_money.format(totalCost)}',
                     style: const TextStyle(fontWeight: FontWeight.w600)),
                 Text(hasMv ? '總市值：${_money.format(totalMv)}' : '總市值：—'),
                 Text(
@@ -784,7 +866,7 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
               if (q == null) {
                 line2 = '現價載入中…';
               } else if (!q.ok) {
-                line2 = '無法取得報價｜成本 ${_money.format(h.cost)}';
+                line2 = '無法取得報價｜實際投入 ${_money.format(h.cost)}';
               } else {
                 final mv = q.price * h.shares;
                 final pnl = mv - h.cost;
@@ -808,8 +890,11 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          '平均成本 ${_money.format(h.buyPrice)} × ${_money.format(h.shares)} 股｜成本 ${_money.format(h.cost)}',
+                          '實際投入 ${_money.format(h.cost)}｜每股實際成本 ${_unit.format(h.costPerShare)}',
+                          style: const TextStyle(fontWeight: FontWeight.w600),
                         ),
+                        const SizedBox(height: 2),
+                        Text('持有 ${_money.format(h.shares)} 股'),
                         const SizedBox(height: 2),
                         Text(line2,
                             style: TextStyle(

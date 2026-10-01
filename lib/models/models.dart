@@ -18,7 +18,12 @@ class Holding {
   final double shares;
   final String note;
 
+  /// Actual invested amount (= per-share actual cost × shares).
   double get cost => buyPrice * shares;
+
+  /// Per-share actual cost (alias of [buyPrice], which already stores the
+  /// weighted average including fees when the user entered an invested amount).
+  double get costPerShare => buyPrice;
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -212,6 +217,44 @@ Map<int, Map<int, List<IncomeRecord>>> groupIncomesByYearMonth(
 
 double sumIncome(Iterable<IncomeRecord> records) =>
     records.fold(0.0, (a, r) => a + r.amount);
+
+/// Per-share actual cost from an actual invested amount (incl. fees).
+double costPerShareFromInvested(double invested, double shares) {
+  if (shares <= 0) throw ArgumentError('股數必須大於 0');
+  if (invested <= 0) throw ArgumentError('實際投入金額必須大於 0');
+  return invested / shares;
+}
+
+/// Build a purchase lot. If [invested] is given it wins over [buyPrice]:
+/// buyPrice (per-share actual cost) = invested / shares.
+Holding buildPurchaseLot({
+  required String id,
+  required String ticker,
+  required String name,
+  required double shares,
+  double? buyPrice,
+  double? invested,
+  String note = '',
+}) {
+  if (shares <= 0) throw ArgumentError('請輸入有效股數');
+  final double price;
+  if (invested != null) {
+    price = costPerShareFromInvested(invested, shares);
+  } else {
+    if (buyPrice == null || buyPrice <= 0) {
+      throw ArgumentError('請輸入有效買入價');
+    }
+    price = buyPrice;
+  }
+  return Holding(
+    id: id,
+    ticker: ticker,
+    name: name,
+    buyPrice: price,
+    shares: shares,
+    note: note,
+  );
+}
 
 /// Apply a sell to holdings using average-cost; returns updated list + record.
 ({List<Holding> holdings, SellRecord record}) applySell({
