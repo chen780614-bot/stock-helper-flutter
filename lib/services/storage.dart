@@ -16,6 +16,12 @@ class NamesCacheData {
 }
 
 class AppStorage {
+  /// Live, in-process mirror of the persisted active holding group id.
+  /// Home and 成本損益 listen to it so switching the group on one tab updates
+  /// the other immediately (value-change only; no extra persisted state).
+  final ValueNotifier<String?> activeHoldingGroupNotifier =
+      ValueNotifier<String?>(null);
+
   static const _watchKey = 'watchlist_v1';
   static const _holdKey = 'holdings_v1';
   static const _sellKey = 'sells_v1';
@@ -442,6 +448,7 @@ class AppStorage {
   Future<void> saveActiveHoldingGroupId(String id) async {
     final p = await SharedPreferences.getInstance();
     await p.setString(_activeHoldGroupKey, id);
+    activeHoldingGroupNotifier.value = id;
   }
 
 }

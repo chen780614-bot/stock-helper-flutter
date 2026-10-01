@@ -72,6 +72,8 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
   void initState() {
     super.initState();
     _tickerCtrl.addListener(_onTickerInputChanged);
+    widget.storage.activeHoldingGroupNotifier
+        .addListener(_onActiveGroupChangedElsewhere);
     _bootstrap();
     if (widget.active) _armTimer();
   }
@@ -86,6 +88,13 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
       _timer?.cancel();
       _timer = null;
     }
+  }
+
+  /// Home (or restore) changed the active group → follow it live.
+  void _onActiveGroupChangedElsewhere() {
+    final id = widget.storage.activeHoldingGroupNotifier.value;
+    if (!mounted || id == null || id == _activeGroupId) return;
+    _reloadHoldings();
   }
 
   void _armTimer() {
@@ -605,6 +614,8 @@ class _HoldingsScreenState extends State<HoldingsScreen> {
     _inputMirror.dispose();
     _resolvedPreview.dispose();
     _previewLookupPending.dispose();
+    widget.storage.activeHoldingGroupNotifier
+        .removeListener(_onActiveGroupChangedElsewhere);
     _priceCtrl.dispose();
     _sharesCtrl.dispose();
     _investedCtrl.dispose();

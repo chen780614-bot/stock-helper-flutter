@@ -35,6 +35,8 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   List<Holding> _holdings = [];
+  List<HoldingGroup> _groups = [];
+  String? _activeGroupId;
   Map<String, Quote> _quotes = {};
   List<({ExDividendEvent event, double shares})> _exEvents = [];
   bool _loading = true;
@@ -50,6 +52,8 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    widget.storage.activeHoldingGroupNotifier
+        .addListener(_onActiveGroupChangedElsewhere);
     _bootstrap();
     if (widget.active) _armTimer();
   }
@@ -64,6 +68,21 @@ class _HomeScreenState extends State<HomeScreen> {
       _timer?.cancel();
       _timer = null;
     }
+  }
+
+  /// 成本損益 (or restore) changed the active group → follow it live.
+  void _onActiveGroupChangedElsewhere() {
+    final id = widget.storage.activeHoldingGroupNotifier.value;
+    if (!mounted || id == null || id == _activeGroupId) return;
+    _reload();
+  }
+
+  Future<void> _switchGroup(String id) async {
+    if (id == _activeGroupId) return;
+    setState(() => _activeGroupId = id);
+    // Persists + notifies 成本損益 via activeHoldingGroupNotifier.
+    await widget.storage.saveActiveHoldingGroupId(id);
+    await _reload();
   }
 
   void _armTimer() {
@@ -84,9 +103,16 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _reload() async {
     setState(() => _refreshing = true);
     // Same universe as 成本損益 (active holding group).
+    final groups = await widget.storage.loadHoldingGroups();
+    final activeId = resolveActiveHoldingGroupId(
+      groups,
+      await widget.storage.loadActiveHoldingGroupId(),
+    );
     final items = await widget.storage.loadPortfolioHoldings(activeGroupOnly: true);
     if (!mounted) return;
     setState(() {
+      _groups = groups;
+      _activeGroupId = activeId;
       _holdings = items;
       _loading = false;
     });
@@ -125,6 +151,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    widget.storage.activeHoldingGroupNotifier
+        .removeListener(_onActiveGroupChangedElsewhere);
     _timer?.cancel();
     super.dispose();
   }
@@ -158,6 +186,35 @@ class _HomeScreenState extends State<HomeScreen> {
             subtitle: '與「成本損益」目前群組同一套計算；盤中即時、收盤後用收盤價。下拉可重新整理。',
           ),
           const SizedBox(height: 8),
+          if (_groups.isNotEmpty)
+            InputDecorator(
+              decoration: const InputDecoration(
+                labelText: '持倉群組（與「成本損益」同步）',
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
+              child: DropdownButtonHideUnderline(
+                child: DropdownButton<String>(
+                  key: const ValueKey('home_group_dropdown'),
+                  isExpanded: true,
+                  value: _activeGroupId,
+                  items: [
+                    for (final x in _groups)
+                      DropdownMenuItem(
+                        value: x.id,
+                        child: Text(
+                          '${x.name}（${x.items.length}）',
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                  ],
+                  onChanged: (id) {
+                    if (id != null) _switchGroup(id);
+                  },
+                ),
+              ),
+            ),
+          if (_groups.isNotEmpty) const SizedBox(height: 8),
           if (_holdings.isEmpty)
             emptyState(
               context,

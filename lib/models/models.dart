@@ -536,3 +536,13 @@ class HoldingGroup {
         items: items ?? this.items,
       );
 }
+
+
+/// Resolve which holding group is active: the persisted [activeId] if it still
+/// exists, otherwise the first group (same fallback as portfolio math).
+/// Returns null when there are no groups.
+String? resolveActiveHoldingGroupId(List<HoldingGroup> groups, String? activeId) {
+  if (groups.isEmpty) return null;
+  if (activeId != null && groups.any((g) => g.id == activeId)) return activeId;
+  return groups.first.id;
+}
